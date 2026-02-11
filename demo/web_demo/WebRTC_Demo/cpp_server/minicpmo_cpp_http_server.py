@@ -19,7 +19,7 @@ from PIL import Image
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1039,6 +1039,11 @@ async def init_sys_prompt(request: InitSysPromptRequest):
     if cpp_restarting:
         print("[init_sys_prompt] 服务正在重启中，请稍后重试", flush=True)
         raise HTTPException(status_code=503, detail="服务正在重启中，请稍后重试")
+
+    # If there is an active session, force stop it to allow the new connection.
+    if current_active_session_id is not None:
+        print(f"[init_sys_prompt] Detected active session {current_active_session_id}, force stopping it...", flush=True)
+        await omni_stop(session_id=current_active_session_id)
     
     try:
         # 清空 output 子目录（每次 init 时清空上一次的输出）
@@ -2576,6 +2581,164 @@ async def _streaming_generate_duplex(generate_request_time):
     
     return StreamingResponse(
         generate_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+# ====================== Frontend Adapter Endpoints ======================
+# These endpoints translate the pre-built frontend's API format (/api/v1/*)
+# to the internal /omni/* endpoints, bypassing the closed-source backend service.
+
+@app.post("/v1/stop")
+async def frontend_stop():
+    """Frontend adapter: Stop current session."""
+    try:
+        result = await omni_stop()
+        return {"code": 0, "message": "ok", "data": result}
+    except HTTPException as e:
+        return {"code": -1, "message": e.detail}
+    except Exception as e:
+        return {"code": -1, "message": str(e)}
+
+
+@app.post("/v1/init_options")
+async def frontend_init_options(request: Request):
+    """Frontend adapter: Initialize with user options."""
+    try:
+        body = await request.json()
+        messages = body.get("messages", [])
+
+        options = {}
+        for msg in messages:
+            for content in msg.get("content", []):
+                if content.get("type") == "options":
+                    options = content.get("options", {})
+
+        high_quality_mode = options.get("hd_video", False)
+        language = "zh"
+        media_type = "omni"
+
+        init_request = InitSysPromptRequest(
+            media_type=media_type,
+            high_quality_mode=high_quality_mode,
+            language=language,
+        )
+        await init_sys_prompt(init_request)
+
+        return {
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "choices": {
+                    "content": f"MiniCPM-o (C++ backend, duplex={current_duplex_mode})"
+                }
+            }
+        }
+    except HTTPException as e:
+        return {"code": -1, "message": e.detail}
+    except Exception as e:
+        return {"code": -1, "message": str(e)}
+
+
+@app.post("/v1/stream")
+async def frontend_stream(request: Request):
+    """Frontend adapter: Send audio/image data for prefill."""
+    try:
+        body = await request.json()
+        messages = body.get("messages", [])
+
+        audio_base64 = None
+        image_base64 = None
+
+        for msg in messages:
+            for content in msg.get("content", []):
+                if content.get("type") == "input_audio":
+                    audio_data = content.get("input_audio", {})
+                    audio_base64 = audio_data.get("data")
+                elif content.get("type") == "image_data":
+                    img_data = content.get("image_data", {})
+                    img_b64 = img_data.get("data")
+                    if img_b64:
+                        image_base64 = img_b64
+
+        if not current_active_session_id:
+            print("[frontend_stream] No active session, auto-initializing...", flush=True)
+            init_request = InitSysPromptRequest(media_type="omni")
+            await init_sys_prompt(init_request)
+
+        prefill_request = StreamingPrefillRequest(
+            audio=audio_base64,
+            image=image_base64,
+        )
+        result = await streaming_prefill(prefill_request)
+        return {"code": 0, "message": "ok", "data": result}
+    except HTTPException as e:
+        return {"code": -1, "message": e.detail}
+    except Exception as e:
+        return {"code": -1, "message": str(e)}
+
+
+@app.post("/v1/completions")
+async def frontend_completions(request: Request):
+    """Frontend adapter: SSE stream for model output."""
+    try:
+        await request.json()
+    except Exception:
+        pass
+
+    if not current_active_session_id:
+        print("[frontend_completions] No active session, auto-initializing...", flush=True)
+        init_request = InitSysPromptRequest(media_type="omni")
+        await init_sys_prompt(init_request)
+
+    generate_response = await streaming_generate()
+    original_body = generate_response.body_iterator
+
+    async def translate_stream():
+        first_chunk = True
+        async for chunk in original_body:
+            if not chunk or not chunk.strip():
+                continue
+
+            for line in chunk.strip().split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get("done") or data.get("break"):
+                    end_event = {"choices": [{"text": "<end>", "audio": ""}]}
+                    yield f"data: {json.dumps(end_event, ensure_ascii=False)}\n\n"
+                    return
+
+                if data.get("error"):
+                    continue
+
+                chunk_data = data.get("chunk_data", {})
+                wav_base64 = chunk_data.get("wav", "")
+                text = chunk_data.get("text", "")
+                if not wav_base64:
+                    continue
+
+                if first_chunk:
+                    first_chunk = False
+                    echo_event = {"choices": [{"text": "", "audio": wav_base64}]}
+                    yield f"data: {json.dumps(echo_event, ensure_ascii=False)}\n\n"
+                    continue
+
+                response_event = {"choices": [{"text": text, "audio": wav_base64}]}
+                yield f"data: {json.dumps(response_event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        translate_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
