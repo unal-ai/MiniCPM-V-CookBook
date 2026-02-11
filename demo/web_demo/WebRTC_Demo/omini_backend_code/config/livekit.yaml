@@ -9,8 +9,8 @@ rtc:
   port_range_end: 50100
   # 禁用外部 IP 探测，使用指定的 node_ip
   use_external_ip: false
-  # 使用宿主机实际 IP
-  node_ip: "192.168.31.127"
+  # 默认回环地址，部署脚本会自动替换为宿主机实际 IP
+  node_ip: "127.0.0.1"
 
 # 房间配置
 room:
@@ -24,8 +24,8 @@ keys:
 # LiveKit内置TURN服务器配置（帮助穿透NAT，确保前端能连接）
 turn:
   enabled: true
-  # 使用宿主机实际 IP
-  domain: "192.168.31.127"
+  # 默认回环地址，部署脚本会自动替换为宿主机实际 IP
+  domain: "127.0.0.1"
   # UDP端口
   udp_port: 7882
   # 不使用TLS（本地开发）

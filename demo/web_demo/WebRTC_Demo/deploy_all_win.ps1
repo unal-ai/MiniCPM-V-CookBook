@@ -16,7 +16,7 @@ param(
     [ValidateSet("simplex", "duplex")]
     [string]$Mode = "simplex",
 
-    [int]$Port = 9260,
+    [int]$Port = 9060,
 
     [string]$CppDir = "",
     [string]$ModelDir = "",
@@ -145,6 +145,21 @@ Write-Host "   Port     :  $Port"       -ForegroundColor Green
 Write-Host "   CPP_DIR  :  $CppDir"     -ForegroundColor Green
 Write-Host "   MODEL_DIR:  $ModelDir"   -ForegroundColor Green
 Write-Host ""
+
+# ==========================================================
+# Sync nginx /api/v1 proxy port with selected inference port
+# ==========================================================
+$nginxConf = Join-Path $SCRIPT_DIR "nginx.conf"
+if (Test-Path $nginxConf) {
+    $nginxRaw = Get-Content $nginxConf -Raw -Encoding UTF8
+    $nginxRaw = [System.Text.RegularExpressions.Regex]::Replace(
+        $nginxRaw,
+        'host\.docker\.internal:\d+/v1/',
+        "host.docker.internal:$Port/v1/"
+    )
+    [System.IO.File]::WriteAllText($nginxConf, $nginxRaw)
+    Write-OK "Nginx /api/v1 proxy port synced to: $Port"
+}
 
 # ==========================================================
 # [1/7] Check Docker
@@ -365,7 +380,7 @@ $registerBody = @{
 } | ConvertTo-Json
 
 try {
-    $result = Invoke-RestMethod -Uri "http://localhost:8021/api/inference/register" `
+    $result = Invoke-RestMethod -Uri "http://localhost:8025/api/inference/register" `
                   -Method POST `
                   -ContentType "application/json" `
                   -Body $registerBody `
@@ -387,7 +402,7 @@ Write-Host "========================================" -ForegroundColor Blue
 Write-Host ""
 Write-Host "   Service URLs:" -ForegroundColor Green
 Write-Host "      Frontend Web UI :  http://localhost:3000"
-Write-Host "      Backend API     :  http://localhost:8021"
+Write-Host "      Backend API     :  http://localhost:8025"
 Write-Host "      Inference       :  http://localhost:${Port}"
 Write-Host "      LiveKit         :  ws://localhost:7880"
 Write-Host ""

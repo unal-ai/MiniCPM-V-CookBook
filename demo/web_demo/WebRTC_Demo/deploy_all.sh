@@ -21,15 +21,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # ============================================================
 
 # llama.cpp-omni 编译后的根目录（包含 build/bin/llama-server）
-# ⚠️ 必须修改
-CPP_DIR="/cache/caitianchi/code/o45/cpp/temp/dev/0_new_code/0_new_release/llama.cpp-omni"
+# 通过 --cpp-dir 或 CPP_DIR 环境变量指定
+CPP_DIR="${CPP_DIR:-}"
 
 # GGUF 模型目录
-# ⚠️ 必须修改
-MODEL_DIR="/cache/caitianchi/code/o45/cpp/temp/dev/gguf"
+# 通过 --model-dir 或 MODEL_DIR 环境变量指定
+MODEL_DIR="${MODEL_DIR:-}"
 
 # Python 解释器路径（自动检测或手动指定）
-PYTHON_BIN="/cache/caitianchi/install/miniconda3/envs/cuda_clean/bin/python3"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo "")}"
 
 # ============================================================
 # 可选配置（有默认值，通常不需要修改）
@@ -83,11 +83,15 @@ while [[ $# -gt 0 ]]; do
             echo "  --model-dir PATH   GGUF 模型目录 (或设置 MODEL_DIR 环境变量)"
             echo ""
             echo "可选参数:"
-            echo "  --python PATH      Python 解释器路径 (默认: 自动检测 python3)"
+            echo "  --python PATH      Python 解释器路径 (默认: 自动检测 python3/python)"
             echo "  --simplex          使用单工模式 (默认)"
             echo "  --duplex           使用双工模式"
-            echo "  --port PORT        指定推理服务端口 (默认: 8060)"
+            echo "  --port PORT        指定推理服务端口 (默认: 9060)"
             echo "  --help             显示帮助信息"
+            echo ""
+            echo "说明:"
+            echo "  本脚本不会自动下载 llama.cpp-omni 或 GGUF 模型，"
+            echo "  请先准备好目录后再通过 --cpp-dir / --model-dir 指定。"
             echo ""
             echo "示例:"
             echo "  $0 --cpp-dir /path/to/llama.cpp-omni --model-dir /path/to/gguf"
@@ -194,6 +198,9 @@ elif command -v ip &> /dev/null; then
 else
     LOCAL_IP="127.0.0.1"
 fi
+if [ -z "$LOCAL_IP" ]; then
+    LOCAL_IP="127.0.0.1"
+fi
 
 echo -e "${GREEN}🖥️  本机 IP: $LOCAL_IP${NC}"
 echo -e "${GREEN}📋 模式: $MODE${NC}"
@@ -201,6 +208,17 @@ echo -e "${GREEN}🔌 端口: $PORT${NC}"
 echo -e "${GREEN}📁 CPP_DIR: $CPP_DIR${NC}"
 echo -e "${GREEN}📁 MODEL_DIR: $MODEL_DIR${NC}"
 echo ""
+
+# ========== 同步 Nginx 到当前推理端口 ==========
+NGINX_CONFIG="$SCRIPT_DIR/nginx.conf"
+if [ -f "$NGINX_CONFIG" ]; then
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -E -i '' "s#host\\.docker\\.internal:[0-9]+/v1/#host.docker.internal:${PORT}/v1/#g" "$NGINX_CONFIG"
+    else
+        sed -E -i "s#host\\.docker\\.internal:[0-9]+/v1/#host.docker.internal:${PORT}/v1/#g" "$NGINX_CONFIG"
+    fi
+    echo -e "${GREEN}✅ Nginx /api/v1 代理端口已同步为: $PORT${NC}"
+fi
 
 # ========== 检查 Docker ==========
 echo -e "${YELLOW}[1/7] 检查 Docker...${NC}"
