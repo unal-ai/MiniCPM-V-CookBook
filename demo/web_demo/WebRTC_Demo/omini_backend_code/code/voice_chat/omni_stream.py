@@ -72,6 +72,8 @@ class OmniStream:
         voice_chat_config = get_voice_chat_settings()
         self.enable_voice_interruption = voice_chat_config.enable_voice_interruption
         self.voice_interruption_threshold = voice_chat_config.voice_interruption_threshold
+        # 最短有效语音尾包阈值，避免几十毫秒噪音触发空轮次 generate
+        self.min_valid_tail_ms = 220
 
     async def _collect_audio_data(self) -> np.ndarray:
         """
@@ -357,7 +359,11 @@ class OmniStream:
                                             break
                                     self.vad_race_flag.clear()
                                 else:
-                                    has_tail_audio = buffer_duration > 50 and len(audio_data_buffer) > 0
+                                    has_tail_audio = buffer_duration > self.min_valid_tail_ms and len(audio_data_buffer) > 0
+                                    if not has_tail_audio and buffer_duration > 0:
+                                        logger.info(
+                                            f"SIMPLEX尾包过短，忽略触发: buffer_duration={buffer_duration:.1f}ms, min={self.min_valid_tail_ms}ms"
+                                        )
                                     # 判断剩下的audio_data_buffer是否大于0.1s,如果大于0.1s,则补最后一片音频后触发生成
                                     if has_tail_audio:
                                         # 发送尾巴音频数据
@@ -395,7 +401,11 @@ class OmniStream:
                                     )
                             else:
                                 # 语音结束：如果存在有效语音缓冲，补尾包并触发一次生成
-                                has_voice_buffer = buffer_duration > 50 and len(audio_data_buffer) > 0
+                                has_voice_buffer = buffer_duration > self.min_valid_tail_ms and len(audio_data_buffer) > 0
+                                if not has_voice_buffer and buffer_duration > 0:
+                                    logger.info(
+                                        f"DUPLEX尾包过短，忽略触发: buffer_duration={buffer_duration:.1f}ms, min={self.min_valid_tail_ms}ms"
+                                    )
                                 if has_voice_buffer:
                                     existing_audio = np.concatenate(audio_data_buffer)
                                     await self.model_prefill(existing_audio, last_chunk=True)

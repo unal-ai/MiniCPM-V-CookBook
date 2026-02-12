@@ -11,6 +11,52 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# 优先选择可达的本机 IPv4（避免 Docker/VPN 虚拟网卡）
+detect_local_ip() {
+    local ip=""
+    local iface=""
+
+    # macOS：优先物理网卡
+    if [[ "$OSTYPE" == "darwin"* ]] && command -v ipconfig >/dev/null 2>&1; then
+        for iface in en0 en1 en2; do
+            ip="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+            if [ -n "$ip" ]; then
+                echo "$ip"
+                return 0
+            fi
+        done
+
+        iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+        if [ -n "$iface" ]; then
+            ip="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+            if [ -n "$ip" ]; then
+                echo "$ip"
+                return 0
+            fi
+        fi
+    fi
+
+    # Linux：默认路由出口地址
+    if command -v ip >/dev/null 2>&1; then
+        ip="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i==\"src\") {print $(i+1); exit}}')"
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    # 兜底
+    if command -v ifconfig >/dev/null 2>&1; then
+        ip="$(ifconfig | awk '/inet / && $2 != \"127.0.0.1\" {print $2; exit}')"
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    echo "127.0.0.1"
+}
+
 # ============================================================
 # 脚本所在目录（自动检测）
 # ============================================================
@@ -203,17 +249,12 @@ echo -e "${BLUE}   MiniCPM-o 一键部署脚本${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
-# 获取本机 IP
-if command -v ifconfig &> /dev/null; then
-    LOCAL_IP=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | head -1 | awk '{print $2}')
-elif command -v ip &> /dev/null; then
-    LOCAL_IP=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | head -1 | awk '{print $2}' | cut -d/ -f1)
-else
-    LOCAL_IP="127.0.0.1"
+# 获取本机 IP（支持外部显式覆盖）
+LIVEKIT_NODE_IP="${LIVEKIT_NODE_IP:-}"
+if [ -z "$LIVEKIT_NODE_IP" ]; then
+    LIVEKIT_NODE_IP="$(detect_local_ip)"
 fi
-if [ -z "$LOCAL_IP" ]; then
-    LOCAL_IP="127.0.0.1"
-fi
+LOCAL_IP="$LIVEKIT_NODE_IP"
 
 # 后端容器回连宿主机推理服务时使用的地址
 # macOS/Windows Docker Desktop 场景优先使用 host.docker.internal，避免取到 VPN/虚拟网卡 IP
@@ -227,6 +268,7 @@ if [ -z "$SERVICE_IP_FOR_BACKEND" ]; then
 fi
 
 echo -e "${GREEN}🖥️  本机 IP: $LOCAL_IP${NC}"
+echo -e "${GREEN}🎯 LiveKit 节点 IP: $LIVEKIT_NODE_IP${NC}"
 echo -e "${GREEN}🔗 注册 IP: $SERVICE_IP_FOR_BACKEND${NC}"
 echo -e "${GREEN}📋 模式: $MODE${NC}"
 echo -e "${GREEN}🔌 端口: $PORT${NC}"
@@ -266,13 +308,13 @@ LIVEKIT_CONFIG="$SCRIPT_DIR/omini_backend_code/config/livekit.yaml"
 if [ -f "$LIVEKIT_CONFIG" ]; then
     # macOS 和 Linux 的 sed 语法不同
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        sed -i '' "s/node_ip: .*/node_ip: \"$LOCAL_IP\"/" "$LIVEKIT_CONFIG"
-        sed -i '' "s/domain: .*/domain: \"$LOCAL_IP\"/" "$LIVEKIT_CONFIG"
+        sed -i '' "s/node_ip: .*/node_ip: \"$LIVEKIT_NODE_IP\"/" "$LIVEKIT_CONFIG"
+        sed -i '' "s/domain: .*/domain: \"$LIVEKIT_NODE_IP\"/" "$LIVEKIT_CONFIG"
     else
-        sed -i "s/node_ip: .*/node_ip: \"$LOCAL_IP\"/" "$LIVEKIT_CONFIG"
-        sed -i "s/domain: .*/domain: \"$LOCAL_IP\"/" "$LIVEKIT_CONFIG"
+        sed -i "s/node_ip: .*/node_ip: \"$LIVEKIT_NODE_IP\"/" "$LIVEKIT_CONFIG"
+        sed -i "s/domain: .*/domain: \"$LIVEKIT_NODE_IP\"/" "$LIVEKIT_CONFIG"
     fi
-    echo -e "${GREEN}✅ LiveKit 配置已更新 (IP: $LOCAL_IP)${NC}"
+    echo -e "${GREEN}✅ LiveKit 配置已更新 (IP: $LIVEKIT_NODE_IP)${NC}"
 else
     echo -e "${RED}❌ LiveKit 配置文件不存在: $LIVEKIT_CONFIG${NC}"
     exit 1

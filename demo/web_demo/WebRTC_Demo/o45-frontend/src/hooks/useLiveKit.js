@@ -391,6 +391,7 @@ const recentStateEventAt = new Map();
 const RECENT_STATE_EVENT_WINDOW_MS = 200;
 const GENERATE_START_COOLDOWN_AFTER_PLAY_END_ACK_MS = 900;
 const NO_AUDIO_GRACE_MS = 1800;
+const MAX_SIGNAL_TRACE_MESSAGES = 200;
 
 function parseStateEvent(message = '') {
     if (typeof message !== 'string') return null;
@@ -410,6 +411,32 @@ function parseStateEvent(message = '') {
         roundId,
         rawRoundId
     };
+}
+
+function appendSignalTraceMessage(record = {}) {
+    const payload =
+        typeof record.payload === 'string'
+            ? record.payload
+            : record.payload === undefined || record.payload === null
+              ? ''
+              : String(record.payload);
+
+    const stateEvent = parseStateEvent(payload);
+    const entry = {
+        direction: record.direction || 'in',
+        timestamp: Date.now(),
+        from: record.from || '',
+        topic: record.topic || 'lk.chat',
+        payload,
+        payloadLength: payload.length,
+        stateName: stateEvent?.name || '',
+        stateRoundId: Number.isInteger(stateEvent?.roundId) ? stateEvent.roundId : null
+    };
+
+    state.messages.push(entry);
+    if (state.messages.length > MAX_SIGNAL_TRACE_MESSAGES) {
+        state.messages.splice(0, state.messages.length - MAX_SIGNAL_TRACE_MESSAGES);
+    }
 }
 
 function extractStateTag(message = '') {
@@ -2678,6 +2705,10 @@ export function useLiveKit() {
         room.on(RoomEvent.Disconnected, reason => {
             const timestamp = formatSyncedTimestamp();
             console.warn(`🚫 [${timestamp}] 房间断开:`, reason);
+            state.connected = false;
+            if (state.status !== 'forbidden') {
+                state.status = '';
+            }
         });
 
         // 🔍 【诊断日志】监听 ICE 连接状态变化（用于诊断网络问题）
@@ -3047,6 +3078,13 @@ export function useLiveKit() {
             }
         });
         async function handleChatMessage(msg, participant) {
+            appendSignalTraceMessage({
+                direction: 'in',
+                from: participant?.identity || participant?.sid || '',
+                topic: 'lk.chat',
+                payload: msg?.message
+            });
+
             console.log('chatmessages: ', JSON.parse(JSON.stringify(state.chatMessages)), state.messageIndex);
             console.log('%c返回聊天数据：' + msg.message, 'color: red; font-size: 30px');
             // 过滤后端测试信息，避免进入聊天列表
@@ -4608,9 +4646,28 @@ export function useLiveKit() {
                 'color: #ff0000; font-weight: bold;'
             );
             console.log('\n\n');
+
+            const errMessage = String(err?.message || err || '');
+            if (errMessage.includes('could not establish pc connection') || errMessage.includes('ICE')) {
+                console.error(
+                    '❌ [网络诊断] WebRTC ICE 建链失败：请检查 LiveKit node_ip/turn.domain 是否指向当前可达网卡'
+                );
+            }
+
             state.error = err;
             state.room = null;
             state.connected = false;
+            state.status = '';
+            state.localTracks = [];
+            state.remoteTracks = {};
+            state.localAudioActive = false;
+            state.remoteAudioActive = {};
+            state.playEndSent = false;
+            state.playEndTimestamp = 0;
+            state.playEndRoundId = null;
+            state.currentRoundHasAudio = false;
+            state.currentGenerateRoundId = null;
+            clearPendingNoAudioTimer('joinRoom 失败清理');
         }
     }
 
@@ -4647,6 +4704,12 @@ export function useLiveKit() {
             try {
                 const jsonStr = JSON.stringify(text);
                 const payload = new TextEncoder().encode(jsonStr);
+                appendSignalTraceMessage({
+                    direction: 'out',
+                    from: state.room?.localParticipant?.identity || '',
+                    topic: 'lk.chat',
+                    payload: jsonStr
+                });
 
                 console.log(`📤 [发送方式对比测试] 打断指令:`, {
                     原始数据: text,
@@ -4704,6 +4767,12 @@ export function useLiveKit() {
 
         try {
             const payload = new TextEncoder().encode(text);
+            appendSignalTraceMessage({
+                direction: 'out',
+                from: state.room?.localParticipant?.identity || '',
+                topic: 'lk.chat',
+                payload: text
+            });
 
             console.log(`📤 [发送详情]:`, {
                 文本长度: text.length + ' chars',

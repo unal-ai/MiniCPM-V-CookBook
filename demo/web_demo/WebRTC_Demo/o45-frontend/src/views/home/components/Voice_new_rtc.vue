@@ -16,8 +16,11 @@
             <!-- <el-button @click="openSelector">打开语音选择器</el-button>
             <VoiceSelectorDialog ref="selectorDialog" @confirm="handleVoice" /> -->
             <div class="footer-btn">
-                <section v-if="!isCalling && !callLoading" @click="initRecording">
-                    <SvgIcon name="start" :disabled="!state.connected" class="start-icon" />
+                <section v-if="!isCalling" @click="handleStartClick">
+                    <SvgIcon
+                        name="start"
+                        :class="`start-icon ${!state.connected || callLoading ? 'start-icon-disabled' : ''}`"
+                    />
                 </section>
                 <section v-if="isCalling && state.status && state.status !== 'connecting'">
                     <div class="text-btn">
@@ -34,7 +37,76 @@
                     <span>{{ t('audioInterruptionBtn') }}</span>
                 </div>
             </div>
-            <div :class="`footer-tips ${callLoading || isCalling ? 'hidden-tips' : ''}`">{{ t('startBtnText') }}</div>
+            <div :class="`footer-tips ${isCalling ? 'hidden-tips' : ''}`">
+                {{ callLoading ? t('connecting') : t('startBtnText') }}
+            </div>
+        </div>
+    </div>
+    <div class="debug-panel-toggle" @click="debugPanelVisible = !debugPanelVisible">
+        {{ debugPanelVisible ? '隐藏诊断' : '显示诊断' }}
+    </div>
+    <div v-if="debugPanelVisible" class="debug-panel" :class="{ collapsed: debugPanelCollapsed }">
+        <div class="debug-panel-header">
+            <div class="debug-panel-title">实时诊断</div>
+            <div class="debug-panel-actions">
+                <button type="button" class="debug-action-btn" @click="copyDebugSnapshot">复制快照</button>
+                <button type="button" class="debug-action-btn" @click="clearDebugEvents">清空事件</button>
+                <button type="button" class="debug-action-btn" @click="debugPanelCollapsed = !debugPanelCollapsed">
+                    {{ debugPanelCollapsed ? '展开' : '收起' }}
+                </button>
+            </div>
+        </div>
+        <div v-show="!debugPanelCollapsed" class="debug-panel-body">
+            <div class="debug-wave-card">
+                <canvas ref="debugWaveCanvas" class="debug-wave-canvas"></canvas>
+                <div class="debug-wave-meta">
+                    <span>本地: {{ Math.round(localWaveLevel * 100) }}%</span>
+                    <span>远端: {{ Math.round(remoteWaveLevel * 100) }}%</span>
+                </div>
+            </div>
+            <div class="debug-grid">
+                <div>连接: {{ state.connected ? 'connected' : 'disconnected' }}</div>
+                <div>状态: {{ state.status || 'empty' }}</div>
+                <div>通话中: {{ isCalling ? 'yes' : 'no' }}</div>
+                <div>加载中: {{ callLoading ? 'yes' : 'no' }}</div>
+                <div>本地说话: {{ state.localAudioActive ? 'yes' : 'no' }}</div>
+                <div>远端说话: {{ Object.values(state.remoteAudioActive).some(Boolean) ? 'yes' : 'no' }}</div>
+                <div>轮次ID: {{ state.currentGenerateRoundId ?? 'N/A' }}</div>
+                <div>play_end: {{ state.playEndSent ? 'sent' : 'idle' }}</div>
+                <div>no-audio剩余: {{ pendingNoAudioMs }}ms</div>
+                <div>消息缓存: {{ state.messages.length }}</div>
+                <div>聊天缓存: {{ state.chatMessages.length }}</div>
+                <div>音频轮次: {{ state.audioRounds.length }}</div>
+            </div>
+            <div class="debug-block">
+                <div class="debug-block-title">播放状态</div>
+                <div v-if="remoteAudioStatusList.length === 0" class="debug-empty">暂无远端音频元素</div>
+                <div v-for="audio in remoteAudioStatusList" :key="audio.sid" class="debug-audio-row">
+                    <span>{{ audio.sid }}</span>
+                    <span>{{ audio.playing ? 'playing' : 'idle' }}</span>
+                    <span>t={{ audio.currentTime }}s</span>
+                    <span>rdy={{ audio.readyState }}</span>
+                    <span>net={{ audio.networkState }}</span>
+                </div>
+            </div>
+            <div class="debug-block">
+                <div class="debug-block-title">最近信令</div>
+                <div v-if="latestSignalMessages.length === 0" class="debug-empty">暂无</div>
+                <div v-for="item in latestSignalMessages" :key="item.timestamp + item.direction + item.payloadLength" class="debug-signal-row">
+                    <span class="dir">{{ item.direction }}</span>
+                    <span class="name">{{ item.stateName || 'text' }}</span>
+                    <span class="payload">{{ item.payloadPreview }}</span>
+                </div>
+            </div>
+            <div class="debug-block">
+                <div class="debug-block-title">最近事件</div>
+                <div v-if="debugEvents.length === 0" class="debug-empty">暂无</div>
+                <div v-for="event in debugEvents" :key="event.id" class="debug-event-row">
+                    <span>{{ event.time }}</span>
+                    <span>{{ event.type }}</span>
+                    <span>{{ event.detail }}</span>
+                </div>
+            </div>
         </div>
     </div>
     <DraggableDialog v-if="showText" :message="state.chatMessages" @close="showText = false" />
@@ -139,6 +211,14 @@
 
     // 远端每个用户的 <audio> 引用集合
     const remoteAudioRefs = {};
+    const attachedAudioTrackBySid = new Map();
+    const AUDIO_ATTACH_DEBUG = import.meta.env.DEV && localStorage.getItem('LK_AUDIO_ATTACH_DEBUG') === '1';
+
+    function logAudioAttachDebug(...args) {
+        if (AUDIO_ATTACH_DEBUG) {
+            console.log(...args);
+        }
+    }
 
     // 性能监测
     const performanceMetrics = {
@@ -147,50 +227,413 @@
         audioContextResumeTime: null
     };
 
+    const debugPanelVisible = ref(true);
+    const debugPanelCollapsed = ref(false);
+    const debugWaveCanvas = ref(null);
+    const localWaveLevel = ref(0);
+    const remoteWaveLevel = ref(0);
+    const debugEvents = ref([]);
+    const debugNow = ref(performance.now());
+
+    const DEBUG_EVENT_LIMIT = 60;
+    const DEBUG_SIGNAL_LIMIT = 12;
+
+    let debugTickTimer = null;
+    let debugWaveRafId = 0;
+    let localWaveSource = null;
+    let localWaveAnalyser = null;
+    let localWaveBuffer = null;
+    let localWaveTrackId = '';
+    let remoteWaveSource = null;
+    let remoteWaveAnalyser = null;
+    let remoteWaveBuffer = null;
+    let remoteWaveTrackId = '';
+
+    const pendingNoAudioMs = computed(() => {
+        if (!state.pendingNoAudioDueAt) return 0;
+        return Math.max(0, Math.round(state.pendingNoAudioDueAt - debugNow.value));
+    });
+
+    const remoteAudioStatusList = computed(() => {
+        debugNow.value;
+        return Object.keys(state.remoteTracks || {}).map(sid => {
+            const element = remoteAudioRefs[sid];
+            return {
+                sid,
+                playing: element ? !element.paused && !element.ended : false,
+                currentTime: element ? element.currentTime.toFixed(2) : '0.00',
+                readyState: element ? element.readyState : -1,
+                networkState: element ? element.networkState : -1
+            };
+        });
+    });
+
+    const latestSignalMessages = computed(() => {
+        const list = Array.isArray(state.messages) ? state.messages : [];
+        return list.slice(-DEBUG_SIGNAL_LIMIT).reverse().map(item => ({
+            ...item,
+            payloadPreview:
+                typeof item.payload === 'string' && item.payload.length > 60
+                    ? item.payload.slice(0, 60) + '...'
+                    : item.payload || ''
+        }));
+    });
+
+    function safeStringify(value) {
+        if (typeof value === 'string') return value;
+        try {
+            return JSON.stringify(value);
+        } catch (error) {
+            return String(value);
+        }
+    }
+
+    function pushDebugEvent(type, detail) {
+        const detailText = safeStringify(detail);
+        debugEvents.value.unshift({
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            time: new Date().toLocaleTimeString(),
+            type,
+            detail: detailText.length > 140 ? detailText.slice(0, 140) + '...' : detailText
+        });
+        if (debugEvents.value.length > DEBUG_EVENT_LIMIT) {
+            debugEvents.value.splice(DEBUG_EVENT_LIMIT);
+        }
+    }
+
+    function getWaveRmsLevel(buffer) {
+        if (!buffer || buffer.length === 0) return 0;
+        let sum = 0;
+        for (let i = 0; i < buffer.length; i++) {
+            const normalized = (buffer[i] - 128) / 128;
+            sum += normalized * normalized;
+        }
+        return Math.min(1, Math.sqrt(sum / buffer.length) * 4);
+    }
+
+    function ensureDebugAudioContext() {
+        if (!globalAudioContext) {
+            globalAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (globalAudioContext.state === 'suspended') {
+            globalAudioContext.resume().catch(() => {});
+        }
+        return globalAudioContext;
+    }
+
+    function teardownLocalWaveAnalyser() {
+        if (localWaveSource) {
+            localWaveSource.disconnect();
+            localWaveSource = null;
+        }
+        if (localWaveAnalyser) {
+            localWaveAnalyser.disconnect();
+            localWaveAnalyser = null;
+        }
+        localWaveBuffer = null;
+        localWaveTrackId = '';
+    }
+
+    function teardownRemoteWaveAnalyser() {
+        if (remoteWaveSource) {
+            remoteWaveSource.disconnect();
+            remoteWaveSource = null;
+        }
+        if (remoteWaveAnalyser) {
+            remoteWaveAnalyser.disconnect();
+            remoteWaveAnalyser = null;
+        }
+        remoteWaveBuffer = null;
+        remoteWaveTrackId = '';
+    }
+
+    function setupLocalWaveAnalyser() {
+        const localTrack = state.localTracks.find(track => track.kind === 'audio' && track.mediaStreamTrack);
+        const trackId = localTrack?.mediaStreamTrack?.id || '';
+        if (!trackId) {
+            teardownLocalWaveAnalyser();
+            localWaveLevel.value = state.localAudioActive ? 0.3 : 0;
+            return;
+        }
+        if (trackId === localWaveTrackId && localWaveAnalyser) return;
+
+        teardownLocalWaveAnalyser();
+        try {
+            const context = ensureDebugAudioContext();
+            const stream = new MediaStream([localTrack.mediaStreamTrack]);
+            localWaveSource = context.createMediaStreamSource(stream);
+            localWaveAnalyser = context.createAnalyser();
+            localWaveAnalyser.fftSize = 512;
+            localWaveBuffer = new Uint8Array(localWaveAnalyser.frequencyBinCount);
+            localWaveSource.connect(localWaveAnalyser);
+            localWaveTrackId = trackId;
+            pushDebugEvent('local-wave', `track=${trackId}`);
+        } catch (error) {
+            pushDebugEvent('local-wave-error', error?.message || error);
+        }
+    }
+
+    function setupRemoteWaveAnalyser() {
+        let remoteTrack = null;
+        for (const sid of Object.keys(state.remoteTracks || {})) {
+            const track = (state.remoteTracks[sid] || []).find(item => item.kind === 'audio' && item.mediaStreamTrack);
+            if (track) {
+                remoteTrack = track;
+                break;
+            }
+        }
+
+        const trackId = remoteTrack?.mediaStreamTrack?.id || '';
+        if (!trackId) {
+            teardownRemoteWaveAnalyser();
+            remoteWaveLevel.value = Object.values(state.remoteAudioActive).some(Boolean) ? 0.3 : 0;
+            return;
+        }
+        if (trackId === remoteWaveTrackId && remoteWaveAnalyser) return;
+
+        teardownRemoteWaveAnalyser();
+        try {
+            const context = ensureDebugAudioContext();
+            const stream = new MediaStream([remoteTrack.mediaStreamTrack]);
+            remoteWaveSource = context.createMediaStreamSource(stream);
+            remoteWaveAnalyser = context.createAnalyser();
+            remoteWaveAnalyser.fftSize = 512;
+            remoteWaveBuffer = new Uint8Array(remoteWaveAnalyser.frequencyBinCount);
+            remoteWaveSource.connect(remoteWaveAnalyser);
+            remoteWaveTrackId = trackId;
+            pushDebugEvent('remote-wave', `track=${trackId}`);
+        } catch (error) {
+            pushDebugEvent('remote-wave-error', error?.message || error);
+        }
+    }
+
+    function drawWavePath(ctx, buffer, baseline, color, fallbackLevel = 0) {
+        const width = ctx.canvas.width / (window.devicePixelRatio || 1);
+        const maxHeight = 22;
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.6;
+
+        if (!buffer || buffer.length === 0) {
+            for (let x = 0; x < width; x++) {
+                const y = baseline + Math.sin((x / 24) * Math.PI + performance.now() / 130) * fallbackLevel * maxHeight;
+                if (x === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            return;
+        }
+
+        for (let x = 0; x < width; x++) {
+            const idx = Math.min(buffer.length - 1, Math.floor((x / width) * buffer.length));
+            const v = (buffer[idx] - 128) / 128;
+            const y = baseline + v * maxHeight;
+            if (x === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+    }
+
+    function renderDebugWave() {
+        const canvas = debugWaveCanvas.value;
+        if (!canvas) {
+            debugWaveRafId = requestAnimationFrame(renderDebugWave);
+            return;
+        }
+
+        const dpr = window.devicePixelRatio || 1;
+        const width = canvas.clientWidth || 360;
+        const height = canvas.clientHeight || 120;
+        if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+        }
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+            debugWaveRafId = requestAnimationFrame(renderDebugWave);
+            return;
+        }
+
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(0, 0, width, height);
+
+        const topLine = 34;
+        const bottomLine = 86;
+        ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, topLine);
+        ctx.lineTo(width, topLine);
+        ctx.moveTo(0, bottomLine);
+        ctx.lineTo(width, bottomLine);
+        ctx.stroke();
+
+        if (localWaveAnalyser && localWaveBuffer) {
+            localWaveAnalyser.getByteTimeDomainData(localWaveBuffer);
+            localWaveLevel.value = getWaveRmsLevel(localWaveBuffer);
+        } else {
+            localWaveLevel.value = state.localAudioActive ? 0.4 : Math.max(0, localWaveLevel.value * 0.9);
+        }
+
+        if (remoteWaveAnalyser && remoteWaveBuffer) {
+            remoteWaveAnalyser.getByteTimeDomainData(remoteWaveBuffer);
+            remoteWaveLevel.value = getWaveRmsLevel(remoteWaveBuffer);
+        } else {
+            remoteWaveLevel.value = Object.values(state.remoteAudioActive).some(Boolean)
+                ? 0.4
+                : Math.max(0, remoteWaveLevel.value * 0.9);
+        }
+
+        drawWavePath(ctx, localWaveBuffer, topLine, '#22d3ee', localWaveLevel.value);
+        drawWavePath(ctx, remoteWaveBuffer, bottomLine, '#f97316', remoteWaveLevel.value);
+
+        ctx.fillStyle = '#cbd5e1';
+        ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText('local', 8, 15);
+        ctx.fillText('remote', 8, 66);
+
+        debugWaveRafId = requestAnimationFrame(renderDebugWave);
+    }
+
+    function getLocalTrackKey() {
+        return state.localTracks
+            .map(track => `${track.kind}:${track.mediaStreamTrack?.id || track.sid || ''}`)
+            .join('|');
+    }
+
+    function getRemoteTrackKey() {
+        return Object.keys(state.remoteTracks || {})
+            .sort()
+            .map(sid =>
+                (state.remoteTracks[sid] || [])
+                    .map(track => `${sid}:${track.kind}:${track.mediaStreamTrack?.id || track.sid || ''}`)
+                    .join('|')
+            )
+            .join('##');
+    }
+
+    function copyDebugSnapshot() {
+        const snapshot = {
+            timestamp: new Date().toISOString(),
+            state: {
+                connected: state.connected,
+                status: state.status,
+                isCalling: isCalling.value,
+                callLoading: callLoading.value,
+                localAudioActive: state.localAudioActive,
+                remoteAudioActive: state.remoteAudioActive,
+                currentGenerateRoundId: state.currentGenerateRoundId,
+                playEndSent: state.playEndSent,
+                playEndRoundId: state.playEndRoundId,
+                pendingNoAudioMs: pendingNoAudioMs.value
+            },
+            cache: {
+                signalMessages: state.messages.length,
+                chatMessages: state.chatMessages.length,
+                audioRounds: state.audioRounds.length
+            },
+            audioElements: remoteAudioStatusList.value,
+            recentSignals: latestSignalMessages.value,
+            recentEvents: debugEvents.value.slice(0, 20)
+        };
+
+        const text = JSON.stringify(snapshot, null, 2);
+        if (!navigator.clipboard?.writeText) {
+            ElMessage({
+                type: 'warning',
+                message: '当前浏览器不支持剪贴板 API',
+                duration: 2200
+            });
+            return;
+        }
+
+        navigator.clipboard.writeText(text).then(() => {
+            ElMessage({
+                type: 'success',
+                message: '诊断快照已复制',
+                duration: 1800
+            });
+        }).catch(() => {
+            ElMessage({
+                type: 'warning',
+                message: '复制失败，请检查浏览器剪贴板权限',
+                duration: 2200
+            });
+        });
+    }
+
+    function clearDebugEvents() {
+        debugEvents.value = [];
+    }
+
+    function startDebugRuntime() {
+        if (!debugTickTimer) {
+            debugTickTimer = setInterval(() => {
+                debugNow.value = performance.now();
+            }, 250);
+        }
+        if (!debugWaveRafId) {
+            debugWaveRafId = requestAnimationFrame(renderDebugWave);
+        }
+    }
+
+    function stopDebugRuntime() {
+        if (debugTickTimer) {
+            clearInterval(debugTickTimer);
+            debugTickTimer = null;
+        }
+        if (debugWaveRafId) {
+            cancelAnimationFrame(debugWaveRafId);
+            debugWaveRafId = 0;
+        }
+        teardownLocalWaveAnalyser();
+        teardownRemoteWaveAnalyser();
+    }
+
     /**
      * 简化的音频轨道attach函数 - 专注于速度
      */
-    function attachAudioTrackImmediate(track, audioElement, sid) {
+    function attachAudioTrackImmediate(track, audioElement, sid, source = 'unknown') {
         const startTime = performance.now();
+        if (!track || !audioElement) return false;
+
+        const trackSid = track?.sid || track?.mediaStreamTrack?.id || 'unknown-track';
+        const attachKey = `${sid}:${trackSid}`;
+
+        // 幂等保护：相同 sid + 相同 track 已经挂到同一个 audio 元素时，不重复 attach
+        if (audioElement.dataset.lkAttachKey === attachKey) {
+            return false;
+        }
+
+        if (attachedAudioTrackBySid.get(sid) === trackSid && remoteAudioRefs[sid] === audioElement) {
+            audioElement.dataset.lkAttachKey = attachKey;
+            return false;
+        }
 
         try {
-            // 立即attach，不做额外检查
             track.attach(audioElement);
+            audioElement.dataset.lkAttachKey = attachKey;
+            attachedAudioTrackBySid.set(sid, trackSid);
 
             // 记录性能指标
             if (!performanceMetrics.firstAudioAttachTime) {
                 performanceMetrics.firstAudioAttachTime = performance.now();
             }
 
-            console.log(`🔊 音频轨道attach: ${(performance.now() - startTime).toFixed(2)}ms`, { sid });
+            logAudioAttachDebug(`🔊 音频轨道attach: ${(performance.now() - startTime).toFixed(2)}ms`, {
+                sid,
+                source,
+                trackSid
+            });
+            return true;
         } catch (error) {
             console.error('音频轨道attach失败:', error, { sid });
+            return false;
         }
     }
-
-    /**
-     * 2. 监听远端轨道 - 移除Vue延迟，优先使用LiveKit事件
-     */
-    watch(
-        () => state.remoteTracks,
-        remMap => {
-            // 移除 nextTick 以减少延迟
-            for (const sid in remMap) {
-                const tracks = remMap[sid];
-                const audioTrack = tracks.find(t => t.kind === 'audio');
-                if (audioTrack && remoteAudioRefs[sid]) {
-                    const attachStart = performance.now();
-                    console.log('远端音频轨道变化 (Vue watch):', { sid, trackId: audioTrack.sid });
-
-                    // 立即 attach，不做额外处理
-                    audioTrack.attach(remoteAudioRefs[sid]);
-
-                    console.log(`🔊 Vue watch attach 耗时: ${(performance.now() - attachStart).toFixed(2)}ms`);
-                }
-            }
-        },
-        { deep: true }
-    );
 
     /**
      * 优化的远端 <audio> ref 回调 - 激进低延迟版本
@@ -198,6 +641,7 @@
     function setRemoteAudioRef(sid) {
         return el => {
             if (!el) return;
+            if (remoteAudioRefs[sid] === el) return;
 
             const refStart = performance.now();
 
@@ -211,20 +655,20 @@
 
             // 添加性能监测事件
             el.onloadstart = () => {
-                console.log(`🎵 音频开始加载: ${sid}, ${performance.now()}`);
+                logAudioAttachDebug(`🎵 音频开始加载: ${sid}, ${performance.now()}`);
             };
 
             el.oncanplay = () => {
-                console.log(`🎵 音频可播放: ${sid}, ${performance.now()}`);
+                logAudioAttachDebug(`🎵 音频可播放: ${sid}, ${performance.now()}`);
             };
 
             el.onplay = () => {
                 const playTime = performance.now();
                 if (!performanceMetrics.firstAudioPlayTime) {
                     performanceMetrics.firstAudioPlayTime = playTime;
-                    console.log(`🎵 首次音频播放: ${sid}, 时间: ${playTime}`);
+                    logAudioAttachDebug(`🎵 首次音频播放: ${sid}, 时间: ${playTime}`);
                 } else {
-                    console.log(`🎵 音频播放: ${sid}, 时间: ${playTime}`);
+                    logAudioAttachDebug(`🎵 音频播放: ${sid}, 时间: ${playTime}`);
                 }
                 // 记录到全局轮次结构中
                 try {
@@ -244,11 +688,13 @@
                             if (round.audioStartSignalAt)
                                 deltas.fromAudioSignalToPlay = round.firstPlayAt - round.audioStartSignalAt;
                             round.deltas = deltas;
-                            console.log('⏱️ 首次播放时间记录:', { round: round.round, ...round });
+                            logAudioAttachDebug('⏱️ 首次播放时间记录:', { round: round.round, ...round });
                         }
                     }
                 } catch (e) {
-                    console.warn('记录首次播放时间失败:', e);
+                    if (AUDIO_ATTACH_DEBUG) {
+                        console.warn('记录首次播放时间失败:', e);
+                    }
                 }
             };
 
@@ -256,16 +702,20 @@
                 console.error(`🎵 音频播放错误: ${sid}`, err);
             };
 
+            const prevElement = remoteAudioRefs[sid];
+            if (prevElement && prevElement !== el && prevElement.dataset?.lkAttachKey) {
+                delete prevElement.dataset.lkAttachKey;
+            }
             remoteAudioRefs[sid] = el;
 
-            console.log(`🎵 Audio ref 设置耗时: ${(performance.now() - refStart).toFixed(2)}ms`);
+            logAudioAttachDebug(`🎵 Audio ref 设置耗时: ${(performance.now() - refStart).toFixed(2)}ms`);
 
             // 如果远端音轨已存在，就立即 attach
             const tracks = state.remoteTracks[sid] || [];
             const at = tracks.find(t => t.kind === 'audio');
             if (at) {
-                console.log(`🚀 立即 attach 已存在的轨道: ${sid}`);
-                attachAudioTrackImmediate(at, el, sid);
+                logAudioAttachDebug(`🚀 立即 attach 已存在的轨道: ${sid}`);
+                attachAudioTrackImmediate(at, el, sid, 'setRemoteAudioRef');
             }
         };
     }
@@ -297,13 +747,89 @@
         { deep: true }
     );
 
+    watch(
+        () => state.status,
+        (next, prev) => {
+            pushDebugEvent('status', `${prev || 'empty'} -> ${next || 'empty'}`);
+        },
+        { immediate: true }
+    );
+
+    watch(
+        () => state.connected,
+        connected => {
+            pushDebugEvent('connection', connected ? 'connected' : 'disconnected');
+        },
+        { immediate: true }
+    );
+
+    watch(
+        () => state.localAudioActive,
+        active => {
+            pushDebugEvent('local-audio', active ? 'active' : 'idle');
+        }
+    );
+
+    watch(
+        () => JSON.stringify(state.remoteAudioActive || {}),
+        payload => {
+            pushDebugEvent('remote-audio', payload);
+        }
+    );
+
+    watch(
+        () => state.currentGenerateRoundId,
+        roundId => {
+            if (roundId !== null && roundId !== undefined) {
+                pushDebugEvent('round', `current=${roundId}`);
+            }
+        }
+    );
+
+    watch(
+        () => state.playEndSent,
+        flag => {
+            pushDebugEvent('play_end', flag ? 'sent' : 'reset');
+        }
+    );
+
+    watch(
+        () => state.messages.length,
+        (next, prev) => {
+            if (next <= prev) return;
+            const last = state.messages[next - 1];
+            if (!last) return;
+            pushDebugEvent('signal', `${last.direction}/${last.stateName || 'text'}`);
+        }
+    );
+
+    watch(
+        getLocalTrackKey,
+        () => {
+            setupLocalWaveAnalyser();
+        },
+        { immediate: true }
+    );
+
+    watch(
+        getRemoteTrackKey,
+        () => {
+            setupRemoteWaveAnalyser();
+        },
+        { immediate: true }
+    );
+
     // 清理函数：接受一个 SID 数组（或空表示全部）
     registerCleanup((sids = []) => {
         const list = sids.length ? sids : Object.keys(remoteAudioRefs);
         list.forEach(sid => {
             const el = remoteAudioRefs[sid];
+            if (el?.dataset?.lkAttachKey) {
+                delete el.dataset.lkAttachKey;
+            }
             if (el?.parentNode) el.parentNode.removeChild(el);
             delete remoteAudioRefs[sid];
+            attachedAudioTrackBySid.delete(sid);
         });
     });
 
@@ -312,6 +838,14 @@
     const mode = ref('audio'); // 'video' or 'audio'
     const count = ref(0);
     let sendTimer = null;
+
+    const handleStartClick = () => {
+        if (callLoading.value || isCalling.value) {
+            return;
+        }
+        initRecording();
+    };
+
     const initRecording = async () => {
         const startTime = performance.now();
         console.log(`🚀 开始初始化录音连接: ${startTime}`);
@@ -322,78 +856,89 @@
         //     return;
         // }
         callLoading.value = true;
-        if (!route.query.token) {
-            const rtcTokenStorage = localStorage.getItem('rtcToken');
-            const userIdStorage = localStorage.getItem('userId');
-            if (rtcTokenStorage && userIdStorage) {
-                await logoutRtc({
-                    token: rtcTokenStorage,
-                    userId: userIdStorage
-                });
-                localStorage.removeItem('rtcToken');
-                localStorage.removeItem('userId');
-            }
-            const { code, data } = await getRtcToken('audio');
-            console.log('获取到的token:', data, code);
-            if (code === 0 && data.token) {
-                token.value = data.token;
-                userId.value = data.userId;
-                localStorage.setItem('rtcToken', data.token);
-                localStorage.setItem('userId', data.userId);
 
-                // 保存session_id到localStorage
-                if (data.sessionId) {
-                    saveSessionId(data.sessionId);
-                    localStorage.setItem('sessionId', data.sessionId);
-                    emits('updateSessionId', data.sessionId);
+        try {
+            if (!route.query.token) {
+                const rtcTokenStorage = localStorage.getItem('rtcToken');
+                const userIdStorage = localStorage.getItem('userId');
+                if (rtcTokenStorage && userIdStorage) {
+                    await logoutRtc({
+                        token: rtcTokenStorage,
+                        userId: userIdStorage
+                    });
+                    localStorage.removeItem('rtcToken');
+                    localStorage.removeItem('userId');
+                }
+                const { code, data } = await getRtcToken('audio');
+                console.log('获取到的token:', data, code);
+                if (code === 0 && data.token) {
+                    token.value = data.token;
+                    userId.value = data.userId;
+                    localStorage.setItem('rtcToken', data.token);
+                    localStorage.setItem('userId', data.userId);
+
+                    // 保存session_id到localStorage
+                    if (data.sessionId) {
+                        saveSessionId(data.sessionId);
+                        localStorage.setItem('sessionId', data.sessionId);
+                        emits('updateSessionId', data.sessionId);
+                    }
+                } else {
+                    ElMessage({
+                        type: 'error',
+                        message: t('tokenErrMsg'),
+                        duration: 3000,
+                        customClass: 'system-error'
+                    });
+                    return;
                 }
             } else {
+                token.value = route.query.token;
+            }
+
+            const config = { userAgent: navigator.userAgent, joinTime: Date.now() };
+
+            // 🔧 准备初始化配置，直接传入 joinRoom 避免时序竞争
+            const initConfig = {
+                interface: 'init',
+                type: 'audio',
+                model: localStorage.getItem('model') || 'MiniCPM-o2.6'
+            };
+            localStorage.setItem('initStatus', '');
+            console.log('💾 准备初始化配置，传入 joinRoom...');
+
+            const joinStartTime = performance.now();
+            await joinRoom(resolveLivekitUrl(), token.value, mode.value, config, initConfig);
+            const joinEndTime = performance.now();
+
+            console.log(`🎯 joinRoom耗时: ${(joinEndTime - joinStartTime).toFixed(2)}ms`);
+
+            if (state.error) {
                 ElMessage({
                     type: 'error',
-                    message: t('tokenErrMsg'),
+                    message: t('callErrMsg'),
                     duration: 3000,
                     customClass: 'system-error'
                 });
-                callLoading.value = false;
                 return;
             }
-        } else {
-            token.value = route.query.token;
-        }
 
-        const config = { userAgent: navigator.userAgent, joinTime: Date.now() };
+            isCalling.value = true;
 
-        // 🔧 准备初始化配置，直接传入 joinRoom 避免时序竞争
-        const initConfig = {
-            interface: 'init',
-            type: 'audio',
-            model: localStorage.getItem('model') || 'MiniCPM-o2.6'
-        };
-        localStorage.setItem('initStatus', '');
-        console.log('💾 准备初始化配置，传入 joinRoom...');
-
-        const joinStartTime = performance.now();
-        await joinRoom(resolveLivekitUrl(), token.value, mode.value, config, initConfig);
-        const joinEndTime = performance.now();
-
-        console.log(`🎯 joinRoom耗时: ${(joinEndTime - joinStartTime).toFixed(2)}ms`);
-
-        if (state.error) {
+            // 记录总初始化时间
+            const totalInitTime = performance.now() - startTime;
+            console.log(`✅ 初始化完成，总耗时: ${totalInitTime.toFixed(2)}ms`);
+        } catch (error) {
+            console.error('❌ 初始化录音连接失败:', error);
             ElMessage({
                 type: 'error',
                 message: t('callErrMsg'),
                 duration: 3000,
                 customClass: 'system-error'
             });
+        } finally {
             callLoading.value = false;
-            return;
         }
-        isCalling.value = true;
-        callLoading.value = false;
-
-        // 记录总初始化时间
-        const totalInitTime = performance.now() - startTime;
-        console.log(`✅ 初始化完成，总耗时: ${totalInitTime.toFixed(2)}ms`);
     };
     let audioContext;
     const analyser = ref();
@@ -411,6 +956,7 @@
         nextTick(() => {
             initializeAudioContext();
             setupLiveKitEventHandlers();
+            startDebugRuntime();
             // 移除预加载，因为可能造成延迟
             // preloadAudioResources();
         });
@@ -464,6 +1010,7 @@
     onBeforeUnmount(() => {
         // 页面销毁前也清理一次
         triggerCleanup();
+        stopDebugRuntime();
         if (globalAudioContext) {
             globalAudioContext.close().catch(() => {});
         }
@@ -533,15 +1080,15 @@
 
             if (track.kind === 'audio' && audioElement) {
                 const liveKitAttachStart = performance.now();
-                console.log(`🚀 LiveKit原生事件触发 attach: ${sid}`);
-
-                // 立即 attach，无任何延迟
-                track.attach(audioElement);
+                const didAttach = attachAudioTrackImmediate(track, audioElement, sid, 'registerTrackSubscribed');
+                if (!didAttach) {
+                    return;
+                }
 
                 // 添加详细的音频事件监听器
                 const playingListener = () => {
                     const playingTime = performance.now();
-                    console.log(`%c▶️ [Audio Playing 事件]`, 'color: #00ff00; font-weight: bold; font-size: 14px', {
+                    logAudioAttachDebug(`%c▶️ [Audio Playing 事件]`, 'color: #00ff00; font-weight: bold; font-size: 14px', {
                         参与者SID: sid,
                         触发时间: playingTime.toFixed(2) + 'ms',
                         音频元素状态: {
@@ -563,7 +1110,7 @@
                 };
 
                 const canplayListener = () => {
-                    console.log(`%c🎵 [Audio CanPlay 事件]`, 'color: #ffcc00; font-weight: bold; font-size: 13px', {
+                    logAudioAttachDebug(`%c🎵 [Audio CanPlay 事件]`, 'color: #ffcc00; font-weight: bold; font-size: 13px', {
                         参与者SID: sid,
                         触发时间: performance.now().toFixed(2) + 'ms',
                         readyState: audioElement.readyState
@@ -571,7 +1118,7 @@
                 };
 
                 const loadedmetadataListener = () => {
-                    console.log(
+                    logAudioAttachDebug(
                         `%c📊 [Audio LoadedMetadata 事件]`,
                         'color: #66ccff; font-weight: bold; font-size: 13px',
                         {
@@ -584,8 +1131,10 @@
 
                 // 绑定事件监听器
                 audioElement.addEventListener('playing', playingListener, { once: true });
-                audioElement.addEventListener('canplay', canplayListener, { once: true });
-                audioElement.addEventListener('loadedmetadata', loadedmetadataListener, { once: true });
+                if (AUDIO_ATTACH_DEBUG) {
+                    audioElement.addEventListener('canplay', canplayListener, { once: true });
+                    audioElement.addEventListener('loadedmetadata', loadedmetadataListener, { once: true });
+                }
 
                 // 手动触发播放以确保立即开始
                 const playPromise = audioElement.play();
@@ -598,13 +1147,15 @@
                     });
                 }
 
-                console.log(`🚀 LiveKit attach 耗时: ${(performance.now() - liveKitAttachStart).toFixed(2)}ms`);
+                logAudioAttachDebug(`🚀 LiveKit attach 耗时: ${(performance.now() - liveKitAttachStart).toFixed(2)}ms`);
             } else if (track.kind === 'audio') {
-                console.warn(`⚠️ 音频元素尚未就绪: ${sid}`);
+                if (AUDIO_ATTACH_DEBUG) {
+                    console.warn(`⚠️ 音频元素尚未就绪: ${sid}`);
+                }
             }
         });
 
-        console.log('🎯 LiveKit事件处理器已设置 (激进模式)');
+        logAudioAttachDebug('🎯 LiveKit事件处理器已设置 (激进模式)');
     }
 
     /**
@@ -799,6 +1350,178 @@
     }
 </script>
 <style lang="less" scoped>
+    .debug-panel-toggle {
+        position: fixed;
+        top: 84px;
+        right: 24px;
+        z-index: 999;
+        height: 30px;
+        padding: 0 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(77, 106, 169, 0.4);
+        background: rgba(255, 255, 255, 0.9);
+        color: #1e3a8a;
+        font-size: 12px;
+        line-height: 30px;
+        cursor: pointer;
+        user-select: none;
+        backdrop-filter: blur(6px);
+    }
+
+    .debug-panel {
+        position: fixed;
+        top: 122px;
+        right: 24px;
+        z-index: 998;
+        width: min(460px, calc(100vw - 32px));
+        max-height: calc(100vh - 170px);
+        border-radius: 12px;
+        border: 1px solid rgba(203, 213, 225, 0.7);
+        background: rgba(15, 23, 42, 0.94);
+        color: #e2e8f0;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.25);
+        overflow: hidden;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+    }
+
+    .debug-panel.collapsed {
+        max-height: 42px;
+    }
+
+    .debug-panel-header {
+        height: 42px;
+        padding: 0 10px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.24);
+        background: rgba(15, 23, 42, 0.98);
+    }
+
+    .debug-panel-title {
+        font-size: 12px;
+        color: #93c5fd;
+        letter-spacing: 0.2px;
+    }
+
+    .debug-panel-actions {
+        display: flex;
+        gap: 6px;
+    }
+
+    .debug-action-btn {
+        height: 24px;
+        padding: 0 8px;
+        border-radius: 8px;
+        border: 1px solid rgba(148, 163, 184, 0.45);
+        background: rgba(30, 41, 59, 0.9);
+        color: #e2e8f0;
+        font-size: 11px;
+        cursor: pointer;
+    }
+
+    .debug-panel-body {
+        padding: 10px;
+        overflow: auto;
+        max-height: calc(100vh - 220px);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .debug-wave-card {
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 10px;
+        padding: 8px;
+        background: rgba(15, 23, 42, 0.9);
+    }
+
+    .debug-wave-canvas {
+        width: 100%;
+        height: 118px;
+        border-radius: 8px;
+        display: block;
+        background: #0f172a;
+    }
+
+    .debug-wave-meta {
+        margin-top: 6px;
+        display: flex;
+        justify-content: space-between;
+        font-size: 11px;
+        color: #cbd5e1;
+    }
+
+    .debug-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 4px 8px;
+        font-size: 11px;
+        line-height: 1.4;
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 10px;
+        padding: 8px;
+        background: rgba(30, 41, 59, 0.38);
+    }
+
+    .debug-block {
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 10px;
+        padding: 8px;
+        background: rgba(30, 41, 59, 0.38);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .debug-block-title {
+        font-size: 11px;
+        color: #93c5fd;
+    }
+
+    .debug-empty {
+        font-size: 11px;
+        color: #94a3b8;
+        line-height: 1.4;
+    }
+
+    .debug-audio-row,
+    .debug-signal-row,
+    .debug-event-row {
+        display: grid;
+        gap: 6px;
+        align-items: center;
+        font-size: 11px;
+        line-height: 1.3;
+    }
+
+    .debug-audio-row {
+        grid-template-columns: 1.2fr 0.8fr 0.9fr 0.7fr 0.7fr;
+    }
+
+    .debug-signal-row {
+        grid-template-columns: 0.6fr 0.9fr 2.5fr;
+    }
+
+    .debug-event-row {
+        grid-template-columns: 0.9fr 0.9fr 2.2fr;
+    }
+
+    .debug-signal-row .dir {
+        color: #fbbf24;
+    }
+
+    .debug-signal-row .name {
+        color: #22d3ee;
+    }
+
+    .debug-signal-row .payload {
+        color: #e2e8f0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
     .voice-page {
         flex: 1;
         height: 100%;
@@ -868,6 +1591,10 @@
                 .end-icon {
                     width: 72px;
                     height: 72px;
+                }
+                .start-icon-disabled {
+                    opacity: 0.45;
+                    filter: grayscale(1);
                 }
                 .text-icon,
                 .microphone-icon {

@@ -128,6 +128,14 @@ def _get_default_register_url():
         return "http://127.0.0.1:8025"
 
 REGISTER_URL = os.environ.get("REGISTER_URL", _get_default_register_url())
+# 服务注册模型类型：
+# - release: 同时支持 simplex/duplex（推荐，默认）
+# - simplex/duplex: 仅匹配对应模式
+# - auto: 根据 default_duplex_mode 推导（duplex 或 simplex）
+REGISTER_MODEL_TYPE = os.environ.get("REGISTER_MODEL_TYPE", "release").strip().lower()
+# 后端服务池巡检间隔（秒），用于后端重启后的自动补注册；<=0 表示关闭
+SERVICE_REGISTRY_POLL_INTERVAL = int(os.environ.get("SERVICE_REGISTRY_POLL_INTERVAL", "8"))
+SERVICE_REGISTRY_REQUEST_TIMEOUT = float(os.environ.get("SERVICE_REGISTRY_REQUEST_TIMEOUT", "5"))
 
 # ====================== 全局状态 ======================
 cpp_server_process: Optional[subprocess.Popen] = None
@@ -143,6 +151,8 @@ model_state_initialized: bool = False
 pending_prefill_data: Optional[dict] = None
 is_breaking: bool = False  # break 标志：为 True 时中间层停止向前端发送数据
 health_server_thread: Optional[threading.Thread] = None
+service_registry_watchdog_thread: Optional[threading.Thread] = None
+service_registry_watchdog_stop_event = threading.Event()
 
 # 🔧 [高刷模式] 子图缓存：按 image_audio_id 分组存储（frame_index 1-4 的子图）
 # key: image_audio_id, value: {frame_index: PIL.Image}
@@ -565,10 +575,15 @@ def register_service_node(port: int, duplex_mode: bool):
         return
     
     try:
+        model_type = REGISTER_MODEL_TYPE
+        if model_type == "auto":
+            model_type = "duplex" if duplex_mode else "simplex"
+        if model_type not in ("release", "simplex", "duplex"):
+            print(f"REGISTER_MODEL_TYPE={REGISTER_MODEL_TYPE} 非法，回退到 release", flush=True)
+            model_type = "release"
+
         url = f"{REGISTER_URL}/api/inference/register"
         local_ip = get_local_ip()
-        # 根据 duplex_mode 设置 model_type
-        model_type = "duplex" if duplex_mode else "simplex"
         data = {
             "ip": local_ip,
             "port": port,
@@ -587,6 +602,69 @@ def register_service_node(port: int, duplex_mode: bool):
         import traceback
         print(f"服务节点注册异常: {e}", flush=True)
         traceback.print_exc()
+
+
+def is_service_node_registered(port: int) -> bool:
+    """检查当前服务节点是否已存在于后端服务池。"""
+    if not REGISTER_URL:
+        return True
+
+    try:
+        url = f"{REGISTER_URL}/api/inference/services"
+        local_ip = get_local_ip()
+        service_id = f"{local_ip}:{port}"
+        response = requests.get(url, timeout=SERVICE_REGISTRY_REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            print(f"查询服务池失败: HTTP {response.status_code}, 响应: {response.text}", flush=True)
+            return False
+
+        payload = response.json()
+        services = payload.get("services", [])
+        return any(svc.get("service_id") == service_id for svc in services)
+    except Exception as e:
+        print(f"查询服务池异常: {e}", flush=True)
+        return False
+
+
+def start_service_registry_watchdog(port: int, duplex_mode: bool):
+    """
+    启动注册巡检线程：
+    - 定时检查本节点是否还在后端服务池中
+    - 仅当缺失时补注册，避免后端重启后长期 capacity=0
+    """
+    global service_registry_watchdog_thread
+
+    if not REGISTER_URL:
+        print("跳过注册巡检（未配置 REGISTER_URL）", flush=True)
+        return
+
+    if SERVICE_REGISTRY_POLL_INTERVAL <= 0:
+        print("跳过注册巡检（SERVICE_REGISTRY_POLL_INTERVAL<=0）", flush=True)
+        return
+
+    service_registry_watchdog_stop_event.clear()
+
+    def _watchdog_loop():
+        while not service_registry_watchdog_stop_event.is_set():
+            try:
+                if not is_service_node_registered(port):
+                    print("检测到服务池缺失当前节点，执行补注册...", flush=True)
+                    register_service_node(port=port, duplex_mode=duplex_mode)
+            except Exception as e:
+                print(f"注册巡检线程异常: {e}", flush=True)
+
+            service_registry_watchdog_stop_event.wait(SERVICE_REGISTRY_POLL_INTERVAL)
+
+    service_registry_watchdog_thread = threading.Thread(
+        target=_watchdog_loop,
+        daemon=True,
+        name="service-registry-watchdog"
+    )
+    service_registry_watchdog_thread.start()
+    print(
+        f"服务注册巡检线程已启动: interval={SERVICE_REGISTRY_POLL_INTERVAL}s, register_url={REGISTER_URL}",
+        flush=True
+    )
 
 
 def reset_output_dir():
@@ -767,6 +845,7 @@ def stop_cpp_server():
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     global http_client, health_server_thread, CPP_SERVER_PORT, CPP_SERVER_URL
+    global service_registry_watchdog_thread
     
     # 动态计算 C++ 端口：Python 端口 + 10000
     CPP_SERVER_PORT = app.state.port + 10000
@@ -854,12 +933,19 @@ async def lifespan(app: FastAPI):
     # 注册服务节点（使用默认模式）
     try:
         register_service_node(port=app.state.port, duplex_mode=app.state.default_duplex_mode)
+        start_service_registry_watchdog(port=app.state.port, duplex_mode=app.state.default_duplex_mode)
     except Exception as e:
         print(f"服务节点注册失败: {e}", flush=True)
     
     try:
         yield
     finally:
+        # 停止注册巡检线程
+        service_registry_watchdog_stop_event.set()
+        if service_registry_watchdog_thread and service_registry_watchdog_thread.is_alive():
+            service_registry_watchdog_thread.join(timeout=2)
+        service_registry_watchdog_thread = None
+
         # 关闭 HTTP 客户端
         if http_client:
             await http_client.aclose()
