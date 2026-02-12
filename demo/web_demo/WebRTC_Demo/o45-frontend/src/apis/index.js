@@ -56,7 +56,8 @@ export const getUserInfo = data => {
 };
 // 获取rtc token
 export const getRtcToken = (type = 'none') => {
-    const modelType = localStorage.getItem('modelType') || 'simplex';
+    const envMode = import.meta.env.VITE_CPP_MODE || 'duplex';
+    const modelType = localStorage.getItem('modelType') || envMode;
     const payload = { modelType };
 
     // const durVadTimeValue = localStorage.getItem('durVadTime');
@@ -97,7 +98,8 @@ export const getRtcToken = (type = 'none') => {
         payload.base64Str = window.voiceCloneData.base64Str;
     }
 
-    let url = '';
+    let url = '/api/login';
+    payload.serviceName = 'o45-cpp'; // 先写死
 
     // 高刷配置只在 omni 视频模式下传递（与 saveData 同级）
     if (type === 'omni') {
@@ -107,14 +109,6 @@ export const getRtcToken = (type = 'none') => {
         // 高清模式配置只在 omni 视频模式下传递（与 saveData 同级）
         const highImageValue = localStorage.getItem('hdMode') || 'false';
         payload.highImage = highImageValue === 'true';
-
-        payload.modelType = 'duplex';
-        payload.serviceName = 'o45-cpp'; // 先写死
-        url = '/api/login';
-    } else {
-        payload.modelType = 'simplex';
-        payload.serviceName = 'o45-cpp'; // 先写死
-        url = '/api/login';
     }
 
     // 内部版增加模型配置参数

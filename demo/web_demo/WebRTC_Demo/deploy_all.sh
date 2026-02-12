@@ -41,6 +41,13 @@ SERVER_SCRIPT="${SERVER_SCRIPT:-$SCRIPT_DIR/cpp_server/minicpmo_cpp_http_server.
 # 参考音频路径（默认使用本目录下的 cpp_server/assets/）
 REF_AUDIO="${REF_AUDIO:-$SCRIPT_DIR/cpp_server/assets/default_ref_audio.wav}"
 
+# 前端源码目录（自动构建并同步到 frontend 容器）
+FRONTEND_DIR="${FRONTEND_DIR:-$SCRIPT_DIR/o45-frontend}"
+# 默认优先使用 external 构建模式（和线上镜像一致）
+FRONTEND_BUILD_SCRIPT="${FRONTEND_BUILD_SCRIPT:-build:external}"
+# 是否自动构建前端并同步静态资源到容器（1=开启，0=关闭）
+AUTO_BUILD_FRONTEND="${AUTO_BUILD_FRONTEND:-1}"
+
 # ============================================================
 
 # 默认配置
@@ -87,6 +94,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --simplex          使用单工模式 (默认)"
             echo "  --duplex           使用双工模式"
             echo "  --port PORT        指定推理服务端口 (默认: 9060)"
+            echo "  --no-build-frontend  跳过前端自动构建与同步（默认会自动构建）"
             echo "  --help             显示帮助信息"
             echo ""
             echo "说明:"
@@ -99,6 +107,7 @@ while [[ $# -gt 0 ]]; do
             echo "或使用环境变量:"
             echo "  export CPP_DIR=/path/to/llama.cpp-omni"
             echo "  export MODEL_DIR=/path/to/gguf"
+            echo "  export AUTO_BUILD_FRONTEND=1"
             echo "  $0 --simplex"
             echo ""
             echo "目录结构说明:"
@@ -112,6 +121,10 @@ while [[ $# -gt 0 ]]; do
             echo "    CPP_DIR/build/bin/llama-server  # 编译后的 C++ 服务"
             echo "    MODEL_DIR/                       # GGUF 模型文件"
             exit 0
+            ;;
+        --no-build-frontend)
+            AUTO_BUILD_FRONTEND=0
+            shift
             ;;
         *)
             echo -e "${RED}未知参数: $1${NC}"
@@ -202,11 +215,24 @@ if [ -z "$LOCAL_IP" ]; then
     LOCAL_IP="127.0.0.1"
 fi
 
+# 后端容器回连宿主机推理服务时使用的地址
+# macOS/Windows Docker Desktop 场景优先使用 host.docker.internal，避免取到 VPN/虚拟网卡 IP
+SERVICE_IP_FOR_BACKEND="${SERVICE_IP_FOR_BACKEND:-}"
+if [ -z "$SERVICE_IP_FOR_BACKEND" ]; then
+    if [[ "$OSTYPE" == "darwin"* ]] || [[ "$OSTYPE" == "msys"* ]] || [[ "$OSTYPE" == "cygwin"* ]]; then
+        SERVICE_IP_FOR_BACKEND="host.docker.internal"
+    else
+        SERVICE_IP_FOR_BACKEND="$LOCAL_IP"
+    fi
+fi
+
 echo -e "${GREEN}🖥️  本机 IP: $LOCAL_IP${NC}"
+echo -e "${GREEN}🔗 注册 IP: $SERVICE_IP_FOR_BACKEND${NC}"
 echo -e "${GREEN}📋 模式: $MODE${NC}"
 echo -e "${GREEN}🔌 端口: $PORT${NC}"
 echo -e "${GREEN}📁 CPP_DIR: $CPP_DIR${NC}"
 echo -e "${GREEN}📁 MODEL_DIR: $MODEL_DIR${NC}"
+echo -e "${GREEN}🧩 自动构建前端: $AUTO_BUILD_FRONTEND${NC}"
 echo ""
 
 # ========== 同步 Nginx 到当前推理端口 ==========
@@ -221,7 +247,7 @@ if [ -f "$NGINX_CONFIG" ]; then
 fi
 
 # ========== 检查 Docker ==========
-echo -e "${YELLOW}[1/7] 检查 Docker...${NC}"
+echo -e "${YELLOW}[1/8] 检查 Docker...${NC}"
 if ! command -v docker &> /dev/null; then
     echo -e "${RED}❌ Docker 未安装！请先安装 Docker Desktop${NC}"
     echo "   下载地址: https://www.docker.com/products/docker-desktop"
@@ -235,7 +261,7 @@ fi
 echo -e "${GREEN}✅ Docker 已就绪${NC}"
 
 # ========== 更新 LiveKit 配置 ==========
-echo -e "${YELLOW}[2/7] 更新 LiveKit 配置...${NC}"
+echo -e "${YELLOW}[2/8] 更新 LiveKit 配置...${NC}"
 LIVEKIT_CONFIG="$SCRIPT_DIR/omini_backend_code/config/livekit.yaml"
 if [ -f "$LIVEKIT_CONFIG" ]; then
     # macOS 和 Linux 的 sed 语法不同
@@ -253,7 +279,7 @@ else
 fi
 
 # ========== 加载 Docker 镜像 ==========
-echo -e "${YELLOW}[3/7] 加载 Docker 镜像...${NC}"
+echo -e "${YELLOW}[3/8] 加载 Docker 镜像...${NC}"
 cd "$SCRIPT_DIR"
 
 # 加载前端镜像
@@ -275,10 +301,10 @@ else
 fi
 
 # ========== 启动 Docker 服务 ==========
-echo -e "${YELLOW}[4/7] 启动 Docker 服务...${NC}"
+echo -e "${YELLOW}[4/8] 启动 Docker 服务...${NC}"
 
-# 停止旧服务
-docker compose down 2>/dev/null || true
+# 停止旧服务（含匿名卷，避免残留状态）
+docker compose down --remove-orphans --volumes 2>/dev/null || true
 
 # 启动新服务
 docker compose up -d
@@ -297,8 +323,72 @@ else
     exit 1
 fi
 
+build_and_sync_frontend() {
+    if [ "$AUTO_BUILD_FRONTEND" != "1" ]; then
+        echo -e "${YELLOW}⚠️  已跳过前端自动构建（AUTO_BUILD_FRONTEND=0）${NC}"
+        return 0
+    fi
+
+    if [ ! -d "$FRONTEND_DIR" ] || [ ! -f "$FRONTEND_DIR/package.json" ]; then
+        echo -e "${RED}❌ 前端源码目录不存在或缺少 package.json: $FRONTEND_DIR${NC}"
+        return 1
+    fi
+
+    if ! command -v node >/dev/null 2>&1; then
+        echo -e "${RED}❌ 未检测到 node，无法自动构建前端${NC}"
+        return 1
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        echo -e "${RED}❌ 未检测到 npm，无法自动构建前端${NC}"
+        return 1
+    fi
+
+    echo "   构建前端静态资源..."
+    pushd "$FRONTEND_DIR" >/dev/null
+
+    if [ ! -d node_modules ]; then
+        echo "   安装前端依赖..."
+        if [ -f package-lock.json ]; then
+            npm ci
+        else
+            npm install
+        fi
+    fi
+
+    if ! npm run "$FRONTEND_BUILD_SCRIPT"; then
+        if [ "$FRONTEND_BUILD_SCRIPT" != "build" ]; then
+            echo -e "${YELLOW}⚠️  构建脚本 $FRONTEND_BUILD_SCRIPT 失败，回退到 npm run build${NC}"
+            npm run build
+        else
+            popd >/dev/null
+            return 1
+        fi
+    fi
+    popd >/dev/null
+
+    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
+        echo -e "${RED}❌ 前端构建完成但 dist/index.html 不存在${NC}"
+        return 1
+    fi
+
+    # 先清空旧静态资源，再同步新构建产物，避免残留旧 hash 文件干扰
+    docker exec minicpmo-frontend sh -lc "rm -rf /usr/share/nginx/html/*" >/dev/null 2>&1 || true
+
+    # 同步到运行中的 frontend 容器，确保本地代码改动生效
+    docker cp "$FRONTEND_DIR/dist/." minicpmo-frontend:/usr/share/nginx/html/
+    docker exec minicpmo-frontend sh -lc "nginx -s reload >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    echo -e "${GREEN}✅ 前端静态资源已同步到容器${NC}"
+}
+
+# ========== 自动构建并同步前端 ==========
+echo -e "${YELLOW}[5/8] 构建并同步前端静态资源...${NC}"
+if ! build_and_sync_frontend; then
+    echo -e "${RED}❌ 前端构建/同步失败，部署中止${NC}"
+    exit 1
+fi
+
 # ========== 安装 Python 依赖 ==========
-echo -e "${YELLOW}[5/7] 检查 Python 依赖...${NC}"
+echo -e "${YELLOW}[6/8] 检查 Python 依赖...${NC}"
 REQUIREMENTS="$SCRIPT_DIR/cpp_server/requirements.txt"
 if [ -f "$REQUIREMENTS" ]; then
     echo "   安装 Python 依赖..."
@@ -309,16 +399,20 @@ fi
 echo -e "${GREEN}✅ Python 环境已就绪${NC}"
 
 # ========== 启动 C++ 推理服务 ==========
-echo -e "${YELLOW}[6/7] 启动 C++ 推理服务...${NC}"
+echo -e "${YELLOW}[7/8] 启动 C++ 推理服务...${NC}"
 
-# 停止已有的服务
+# 停止已有的 Python HTTP 服务与可能残留的 llama-server 子进程
+pkill -f "minicpmo_cpp_http_server.py" 2>/dev/null || true
 pkill -f "minicpmo_cpp_http_server" 2>/dev/null || true
+pkill -f "$CPP_DIR/build/bin/llama-server" 2>/dev/null || true
+pkill -f "llama-server --host 0.0.0.0 --port 19060" 2>/dev/null || true
 sleep 27
 
 # 设置环境变量
 export LLAMACPP_ROOT="$CPP_DIR"
 export MODEL_DIR="$MODEL_DIR"
 export REF_AUDIO="$REF_AUDIO"
+export REGISTER_SERVICE_IP="$SERVICE_IP_FOR_BACKEND"
 
 # 启动推理服务
 cd "$CPP_DIR"  # 需要在 CPP_DIR 下运行，因为 llama-server 路径是相对的
@@ -353,10 +447,10 @@ else
 fi
 
 # ========== 注册推理服务 ==========
-echo -e "${YELLOW}[7/7] 注册推理服务...${NC}"
+echo -e "${YELLOW}[8/8] 注册推理服务...${NC}"
 REGISTER_RESULT=$(curl -s -X POST "http://localhost:8025/api/inference/register" \
   -H "Content-Type: application/json" \
-  -d "{\"ip\": \"$LOCAL_IP\", \"port\": $PORT, \"model_port\": $PORT, \"model_type\": \"release\", \"session_type\": \"release\", \"service_name\": \"o45-cpp\"}" 2>/dev/null || echo "")
+  -d "{\"ip\": \"$SERVICE_IP_FOR_BACKEND\", \"port\": $PORT, \"model_port\": $PORT, \"model_type\": \"release\", \"session_type\": \"release\", \"service_name\": \"o45-cpp\"}" 2>/dev/null || echo "")
 
 if echo "$REGISTER_RESULT" | grep -q "service_id\|成功"; then
     echo -e "${GREEN}✅ 推理服务已注册${NC}"
@@ -364,6 +458,21 @@ if echo "$REGISTER_RESULT" | grep -q "service_id\|成功"; then
 else
     echo -e "${YELLOW}⚠️  注册可能失败，请检查后端服务${NC}"
     echo "   $REGISTER_RESULT"
+fi
+
+# ========== 校验服务发现 ==========
+echo "   校验推理服务是否可被调度..."
+SERVICES_RESULT=$(curl -s "http://localhost:8025/api/inference/services?available_only=false" 2>/dev/null || echo "")
+if echo "$SERVICES_RESULT" | grep -Eq '"total":[1-9][0-9]*'; then
+    echo -e "${GREEN}✅ 推理服务调度列表正常${NC}"
+    echo "   $SERVICES_RESULT"
+else
+    echo -e "${RED}❌ 推理服务未出现在调度列表，后续可能出现 'Server at capacity'${NC}"
+    echo "   /api/inference/services 返回: $SERVICES_RESULT"
+    echo "   建议检查日志:"
+    echo "     tail -f /tmp/cpp_server.log"
+    echo "     cd $SCRIPT_DIR && docker compose logs -f backend"
+    exit 1
 fi
 
 # ========== 完成 ==========

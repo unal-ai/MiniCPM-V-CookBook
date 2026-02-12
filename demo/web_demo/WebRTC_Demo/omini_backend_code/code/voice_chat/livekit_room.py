@@ -1,5 +1,6 @@
 from collections import deque
 import json
+import re
 import time
 from livekit import rtc
 import asyncio
@@ -285,15 +286,43 @@ class LiveKitRoom:
         """处理通过 publish_data 接收到的消息"""
         participant_identity = participant.identity if participant else "unknown"
         await self._process_text_command(text_message, participant_identity)
+
+    @staticmethod
+    def _parse_state_message(text: str):
+        """
+        解析状态消息，兼容以下格式：
+        - <state><play_end>
+        - <state><play_end:12>
+        """
+        if not text:
+            return None
+        match = re.search(r"<state><([a-zA-Z0-9_]+)(?::([^>]+))?>", text)
+        if not match:
+            return None
+        state_name = match.group(1)
+        raw_round_id = match.group(2)
+        round_id = None
+        if raw_round_id is not None:
+            raw_round_id = raw_round_id.strip()
+            if raw_round_id.isdigit():
+                round_id = int(raw_round_id)
+        return {
+            "state_name": state_name,
+            "round_id": round_id,
+        }
     
     async def _process_text_command(self, full_text: str, participant_identity: str):
         """处理文本命令的通用方法"""
         logger.info(f"处理来自 {participant_identity} 的消息: '{full_text}'")
-        
-        if full_text == "<state><play_end>":
-            # 重制图片处理的计数
+
+        state_message = self._parse_state_message(full_text)
+        if state_message and state_message["state_name"] == "play_end":
             await self.model_cpm.play_end()
-            await self.push_text_output("<state><play_end_success>")
+            round_id = state_message["round_id"]
+            if round_id is not None:
+                await self.push_text_output(f"<state><play_end_success:{round_id}>")
+            else:
+                await self.push_text_output("<state><play_end_success>")
             return
         
         # 尝试解析JSON指令

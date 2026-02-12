@@ -55,6 +55,7 @@ class OmniStream:
         self.vad_race_audio_queue = asyncio.Queue()
         self.vad_race_text_queue = asyncio.Queue()
         self.vad_race_task = None  # 跟踪当前抢跑任务
+        self.generate_task = None  # 跟踪当前常规生成任务，避免重复触发
 
         # 双工延迟时间 延缓双工的卡顿
         self.duplex_delay_time_flag = False
@@ -137,6 +138,9 @@ class OmniStream:
         """
         处理未检测到语音活动的情况(SIMPLEX模式)
         """
+        if self.model_cpm.model_generating_flag.is_set():
+            logger.info("模型正在输出,忽略generate")
+            return
         if self.model_cpm.model_type == ModelType.SIMPLEX and not self.model_cpm.play_end_event.is_set():
             logger.info("模型和前端正在输出,忽略generate")
             return
@@ -145,15 +149,14 @@ class OmniStream:
             await self.text_output_queue.put(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - <state><vad_end>")
             self.vad_stream_started = False
         current_time = time.time()
+        has_audio_output = False
         try:
-            round_id = await self.shared_state.get_round()
             generator = self.model_cpm.streaming_generate(
                 session_id=self.session_id
             )
             # 每次生成后进行续命服务锁定
             service_manager = await get_service_manager()
             await service_manager.renew_service_lock(self.inference_service.locked_by, self.inference_service.service_id)
-            await self.text_output_queue.put("<state><generate_start>")
             
             async for chunk in generator:
                 logger.info(f"收到流式数据: {chunk}")
@@ -186,6 +189,8 @@ class OmniStream:
                             self.duplex_delay_time_flag = True
                             await asyncio.sleep(1-(time.time() - current_time))
                         await self.audio_output_queue.put(audio_data)
+                        if len(audio_data) > 0:
+                            has_audio_output = True
                     # 处理文本内容
                     text_content = chunk_data.get('text')
                     if text_content is not None:
@@ -193,7 +198,50 @@ class OmniStream:
         except Exception as e:
             logger.error(f"模型生成错误: {str(e)}")
         finally:
-            await self.text_output_queue.put("<state><generate_end>")
+            round_id = self.model_cpm.active_round_id
+            if round_id is None:
+                round_id = await self.shared_state.get_round()
+            await self.text_output_queue.put(f"<state><generate_end:{round_id}>")
+            if not has_audio_output:
+                await self.text_output_queue.put(f"<state><generate_no_audio:{round_id}>")
+
+    def _schedule_model_generate(self, reason: str = ""):
+        """
+        统一调度生成任务，避免 DUPLEX 模式下重复 create_task 导致 generate_start/end 风暴。
+        """
+        if self.stop_event.is_set():
+            return None
+
+        if self.generate_task is not None and not self.generate_task.done():
+            logger.info(f"生成任务已存在，忽略本次触发: {reason}")
+            return None
+
+        if self.model_cpm.model_generating_flag.is_set():
+            logger.info(f"模型正在生成，忽略本次触发: {reason}")
+            return None
+
+        task = asyncio.create_task(self._handle_model_generate())
+        self.generate_task = task
+
+        def _on_done(done_task: asyncio.Task):
+            try:
+                if done_task.cancelled():
+                    logger.warning("生成任务被取消")
+                else:
+                    exc = done_task.exception()
+                    if exc:
+                        logger.error(f"生成任务异常结束: {exc}")
+            except Exception as e:
+                logger.error(f"生成任务回调异常: {e}")
+            finally:
+                if self.generate_task is done_task:
+                    self.generate_task = None
+                if self.vad_race_task is done_task:
+                    self.vad_race_task = None
+
+        task.add_done_callback(_on_done)
+        logger.info(f"创建生成任务: {reason}")
+        return task
 
     def _clear_audio_queues(self) -> None:
         """
@@ -222,6 +270,8 @@ class OmniStream:
         audio_data_buffer = []
         buffer_duration = 0
         target_duration = 1000  # 目标缓冲区时长（毫秒）
+        # 标记本轮是否至少有一次有效 prefill，用于避免“空轮次”误触发 generate
+        simplex_prefilled_this_turn = False
         while not self.stop_event.is_set():
             try:
                 start_time = time.time()
@@ -239,14 +289,27 @@ class OmniStream:
                             loop = asyncio.get_event_loop()
                             full_vad_result, tail_vad_result, dur_vad_full = await loop.run_in_executor(
                                 _vad_thread_pool, self.vad_dual_detection, audio_buffer)
-                            # 如果检测到有语音活动,但是模型正在输出,强制打断模型
-                            # 从配置文件中读取配置来判断是否需要语音打断
-                            if (self.enable_voice_interruption and 
-                                not self.model_cpm.play_end_event.is_set() and 
-                                full_vad_result and 
-                                dur_vad_full > self.voice_interruption_threshold):
-                                asyncio.create_task(self.model_cpm.streaming_break(session_id=self.session_id, text=f"说话打断"))
-                            # SIMPLEX模式：需要VAD检测
+                            model_is_playing = not self.model_cpm.play_end_event.is_set()
+
+                            # 模型播放阶段仅用于打断检测，避免把回声/噪音累计成下一轮输入。
+                            if model_is_playing:
+                                if (
+                                    self.enable_voice_interruption
+                                    and full_vad_result
+                                    and dur_vad_full > self.voice_interruption_threshold
+                                ):
+                                    asyncio.create_task(
+                                        self.model_cpm.streaming_break(
+                                            session_id=self.session_id,
+                                            text="说话打断"
+                                        )
+                                    )
+                                audio_buffer.clear()
+                                buffer_duration = 0
+                                audio_data_buffer = []
+                                simplex_prefilled_this_turn = False
+                                continue
+
                             if full_vad_result:
                                 # 计算当前数据块的时长（毫秒）
                                 chunk_duration = (len(combined_data) / self.WEBRTC_SAMPLE_RATE) * 1000
@@ -256,13 +319,16 @@ class OmniStream:
                                 # 当缓冲区达到目标时长时，处理数据
                                 if buffer_duration >= target_duration:
                                     audio_data_buffer, buffer_duration = await self._process_audio_batch(audio_data_buffer, buffer_duration, target_duration)
+                                    simplex_prefilled_this_turn = True
                                 if self.vad_race:
                                     # 抢跑模式
                                     if not tail_vad_result:
                                         if not self.vad_race_flag.is_set() and self.vad_race_task is None:
                                             # 执行vad抢跑的逻辑
                                             self.vad_race_flag.set()
-                                            self.vad_race_task = asyncio.create_task(self._handle_model_generate())
+                                            task = self._schedule_model_generate("VAD抢跑触发")
+                                            if task is not None:
+                                                self.vad_race_task = task
                                         else:
                                             logger.info("抢跑任务已存在，跳过创建新任务")
                                     else:
@@ -291,29 +357,56 @@ class OmniStream:
                                             break
                                     self.vad_race_flag.clear()
                                 else:
-                                    # 判断剩下的audio_data_buffer是否大于0.1s,如果大于0.1s,则使用静音拼接生成1s的音频发送给模型
-                                    if buffer_duration > 50 and len(audio_data_buffer) > 0:
+                                    has_tail_audio = buffer_duration > 50 and len(audio_data_buffer) > 0
+                                    # 判断剩下的audio_data_buffer是否大于0.1s,如果大于0.1s,则补最后一片音频后触发生成
+                                    if has_tail_audio:
                                         # 发送尾巴音频数据
                                         existing_audio = np.concatenate(audio_data_buffer)
                                         await self.model_prefill(existing_audio, last_chunk=True)
-                                    asyncio.create_task(self._handle_model_generate())
+                                    # 只有本轮确实收到过有效语音时，才触发 generate，避免空轮次。
+                                    if simplex_prefilled_this_turn or has_tail_audio:
+                                        self._schedule_model_generate("SIMPLEX无语音触发生成")
+                                    else:
+                                        logger.info("SIMPLEX无有效语音缓存，跳过生成触发")
                                 # 单工输出之后清理之前的缓冲区数据
                                 audio_buffer.clear()
                                 buffer_duration = 0
                                 audio_data_buffer = []
+                                simplex_prefilled_this_turn = False
                                 self._clear_audio_queues()
                         elif self.model_cpm.model_type == ModelType.DUPLEX:
-                            # DUPLEX模式：不需要VAD检测，直接处理音频数据
-                            # 计算当前数据块的时长（毫秒）
-                            chunk_duration = (len(combined_data) / self.WEBRTC_SAMPLE_RATE) * 1000
-                            buffer_duration += chunk_duration
-                            audio_data_buffer.append(combined_data)
+                            # DUPLEX 模式也做 VAD 门控，避免静音期间按 1s 节拍反复触发 generate
+                            # 导致“每次只播约1秒、下一轮续播残句”的问题。
+                            loop = asyncio.get_event_loop()
+                            full_vad_result, _, _ = await loop.run_in_executor(
+                                _vad_thread_pool, self.vad_dual_detection, audio_buffer
+                            )
 
-                            # 当缓冲区达到目标时长时，处理数据
-                            if buffer_duration >= target_duration:
-                                audio_data_buffer, buffer_duration = await self._process_audio_batch(audio_data_buffer, buffer_duration, target_duration)
-                                # 双工模式：尝试获取用户输入的文本数据，模型返回的数据
-                                asyncio.create_task(self._handle_model_generate())
+                            if full_vad_result:
+                                # 检测到有效语音：持续 prefill，不立即触发生成
+                                chunk_duration = (len(combined_data) / self.WEBRTC_SAMPLE_RATE) * 1000
+                                buffer_duration += chunk_duration
+                                audio_data_buffer.append(combined_data)
+
+                                # 当缓冲区达到目标时长时，仅做 prefill
+                                if buffer_duration >= target_duration:
+                                    audio_data_buffer, buffer_duration = await self._process_audio_batch(
+                                        audio_data_buffer, buffer_duration, target_duration
+                                    )
+                            else:
+                                # 语音结束：如果存在有效语音缓冲，补尾包并触发一次生成
+                                has_voice_buffer = buffer_duration > 50 and len(audio_data_buffer) > 0
+                                if has_voice_buffer:
+                                    existing_audio = np.concatenate(audio_data_buffer)
+                                    await self.model_prefill(existing_audio, last_chunk=True)
+                                    self._schedule_model_generate("DUPLEX检测到语音结束触发生成")
+
+                                # 清空本轮输入缓存，防止静音继续触发旧数据
+                                audio_buffer.clear()
+                                buffer_duration = 0
+                                audio_data_buffer = []
+                                if has_voice_buffer:
+                                    self._clear_audio_queues()
                 else:
                     # 没有音频数据时，短暂休眠
                     logger.debug("未收集到音频数据，继续等待...")
@@ -426,17 +519,20 @@ class OmniStream:
             logger.info(f"双重VAD处理耗时过长: {total_time*1000:.2f}ms")
         
         # 4. 判断逻辑
-        # 完整1秒音频的VAD检测结果
-        full_vad_result = True
-        if dur_vad_full > 0.4:
-            if self.vad_stream_started == False:
+        # 完整1秒音频的VAD检测结果（默认无语音，避免静音被误判为可生成输入）
+        full_vad_result = self.vad_stream_started
+        if dur_vad_full > self.dur_vad_time:
+            if not self.vad_stream_started:
                 self.vad_time = time.time()
-                self.vad_stream_started = True
-        elif dur_vad_full < 0.1:
-            if self.vad_stream_started:
+            self.vad_stream_started = True
+            full_vad_result = True
+        elif self.vad_stream_started and dur_vad_full < self.dur_vad_threshold:
+            # 进入静音段后，满足最小时长才认定语音结束，避免句中短停顿误切轮
+            if (time.time() - self.vad_time) >= 0.3:
                 self.vad_stream_started = False
-                if (time.time() - self.vad_time >= 0.3):
-                    full_vad_result = False
+                full_vad_result = False
+            else:
+                full_vad_result = True
         logger.info(f"dur_vad_full: {dur_vad_full}, dur_vad_tail: {dur_vad_tail}")
         # 最后0.2秒音频的VAD检测结果
         tail_vad_result = True
@@ -448,6 +544,8 @@ class OmniStream:
                     self.vad_race_prepare = False
                 else:
                     self.vad_race_prepare = True
+        else:
+            self.vad_race_prepare = False
         
         return full_vad_result, tail_vad_result, dur_vad_full
     
@@ -463,7 +561,6 @@ class OmniStream:
             #     logger.info(f"抢跑模型预解码已启动,忽略本次抢跑")
             #     return
             generator = self.model_cpm.streaming_generate(session_id=self.session_id)
-            await self.text_output_queue.put("<state><generate_start>")
             async for chunk in generator:
                 logger.info(f"抢跑收到流式数据: {chunk}")
                 if not self.vad_race_flag.is_set():
@@ -477,7 +574,6 @@ class OmniStream:
                 
                 if chunk.get('type') == 'done':
                     break
-            await self.text_output_queue.put("<state><generate_end>")
         except Exception as e:
             logger.error(f"模型生成错误: {str(e)}")
         finally:

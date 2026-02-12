@@ -333,12 +333,19 @@ const state = reactive({
     pendingRoundIndex: -1,
     playEndSent: false, // 标记是否已发送 play_end（用于防止延迟音频包干扰）
     playEndTimestamp: 0, // 记录发送 play_end 的时间戳
+    playEndRoundId: null, // 最近一次 play_end 对应的轮次
     currentRoundHasAudio: false, // 标记当前轮次是否有音频（用于检测空轮次）
-    generateEndTimestamp: 0 // 🔧 记录 generate_end 的接收时间（用于静默检查保护）
+    currentGenerateRoundId: null, // 当前 generate 轮次（由后端 round_id 驱动）
+    pendingNoAudioRoundId: null, // no-audio 保护中的轮次
+    pendingNoAudioDueAt: 0, // no-audio 保护预计触发时间
+    generateEndTimestamp: 0, // 🔧 记录 generate_end 的接收时间（用于静默检查保护）
+    lastPlayEndAckTimestamp: 0 // 记录收到 play_end_success 的时间，用于抑制紧随其后的误触发 generate_start
 });
 
 let timer = null;
 let noRobotTimer = null; // 用于检测是否有机器人加入的定时器
+let pendingPlayEndTimer = null; // 延迟发送 play_end 的保护定时器
+let pendingNoAudioTimer = null; // no-audio 场景的延迟结束定时器
 
 // 🔧 新增：视频健康监控定时器
 let videoHealthCheckTimer = null;
@@ -359,13 +366,15 @@ const SILENCE_CONFIG = {
         timeout: 800, // 🔧 音频模式：500ms → 800ms（容忍多段音频间隔和网络延迟）
         safetyDelay: 300, // 🔧 安全延迟：200ms → 300ms（增加保护时间）
         generateEndBuffer: 1000, // 🔧 generate_end 缓冲：600ms → 1000ms（关键：实际测试显示延迟可达 782ms）
-        minAudioDuration: 600 // 🔧 新增：短音频最小保护时间 600ms（两个字音频约 400-500ms）
+        minAudioDuration: 600, // 🔧 新增：短音频最小保护时间 600ms（两个字音频约 400-500ms）
+        minPlayEndGuard: 2200 // 🔧 新增：收到音频后至少保活 2.2s，避免 speaking 抖动导致 1 秒截断
     },
     video: {
         timeout: 1500, // 🔧 视频模式：1200ms → 1500ms（视频模式网络开销更大）
         safetyDelay: 500, // 🔧 安全延迟：400ms → 500ms（增加保护时间）
         generateEndBuffer: 1200, // 🔧 generate_end 缓冲：800ms → 1200ms（视频模式网络延迟更大）
-        minAudioDuration: 800 // 🔧 新增：短音频最小保护时间 800ms
+        minAudioDuration: 800, // 🔧 新增：短音频最小保护时间 800ms
+        minPlayEndGuard: 2600 // 视频模式适当更长，避免网络抖动下提早结束
     }
 };
 
@@ -375,6 +384,78 @@ const getSilenceConfig = () => SILENCE_CONFIG[state.mode] || SILENCE_CONFIG.audi
 const silenceTimers = new Map();
 // 🔥 新增：音频结束确认计数器（防止误判）
 const audioEndConfirmCount = new Map(); // { participantSid: confirmCount }
+// 参与者 speaking 监听器，避免重复订阅导致状态机抖动
+const participantSpeakingListeners = new Map(); // { sid: { participant, handler } }
+// 状态消息去重缓存，避免同一消息多通道重复消费
+const recentStateEventAt = new Map();
+const RECENT_STATE_EVENT_WINDOW_MS = 200;
+const GENERATE_START_COOLDOWN_AFTER_PLAY_END_ACK_MS = 900;
+const NO_AUDIO_GRACE_MS = 1800;
+
+function parseStateEvent(message = '') {
+    if (typeof message !== 'string') return null;
+    const match = message.match(/<state><([a-zA-Z0-9_]+)(?::([^>]+))?>/);
+    if (!match) return null;
+
+    const name = match[1] || '';
+    const rawRoundId = match[2] ? match[2].trim() : null;
+    let roundId = null;
+    if (rawRoundId && /^-?\d+$/.test(rawRoundId)) {
+        roundId = Number.parseInt(rawRoundId, 10);
+    }
+
+    return {
+        tag: match[0],
+        name,
+        roundId,
+        rawRoundId
+    };
+}
+
+function extractStateTag(message = '') {
+    const parsed = parseStateEvent(message);
+    return parsed ? parsed.tag : null;
+}
+
+function shouldIgnoreDuplicateStateEvent(message = '') {
+    const stateEvent = parseStateEvent(message);
+    if (!stateEvent) return false;
+
+    // 仅对高频且会驱动状态机的关键事件做去重
+    const dedupeNames = new Set([
+        'round_start',
+        'generate_start',
+        'generate_end',
+        'audio_start',
+        'tts_first_pcm',
+        'generate_no_audio',
+        'vad_end',
+        'play_end_success'
+    ]);
+
+    if (!dedupeNames.has(stateEvent.name)) return false;
+
+    const now = performance.now();
+    const last = recentStateEventAt.get(stateEvent.name) || null;
+    recentStateEventAt.set(stateEvent.name, { at: now, roundId: stateEvent.roundId });
+    if (!last) return false;
+
+    const delta = now - last.at;
+    if (delta < RECENT_STATE_EVENT_WINDOW_MS) {
+        const prevHasRound = Number.isInteger(last.roundId);
+        const currHasRound = Number.isInteger(stateEvent.roundId);
+        const sameRound = prevHasRound && currHasRound && last.roundId === stateEvent.roundId;
+        const shouldIgnore =
+            (!prevHasRound && !currHasRound) || sameRound || (prevHasRound && !currHasRound);
+        if (!shouldIgnore) return false;
+        console.warn(
+            `%c🧹 [${formatSyncedTimestamp()}] 忽略重复状态消息: ${stateEvent.tag} (${delta.toFixed(0)}ms)`,
+            'color: #ffaa00; font-weight: bold;'
+        );
+        return true;
+    }
+    return false;
+}
 
 let onCleanup = null;
 let onTrackSubscribed = null;
@@ -751,6 +832,12 @@ function cleanupOldData() {
 function cleanupOnSessionEnd() {
     console.log('🧹 会话结束，开始彻底清理所有数据...');
 
+    if (pendingPlayEndTimer) {
+        clearTimeout(pendingPlayEndTimer);
+        pendingPlayEndTimer = null;
+    }
+    clearPendingNoAudioTimer('会话结束清理');
+
     // 清理所有累积数据
     state.audioRounds = [];
     state.chatMessages = [];
@@ -761,7 +848,9 @@ function cleanupOnSessionEnd() {
     // 重置状态
     state.playEndSent = false;
     state.playEndTimestamp = 0;
+    state.playEndRoundId = null;
     state.currentRoundHasAudio = false;
+    state.currentGenerateRoundId = null;
     state.generateEnd = false;
     state.generateEndTimestamp = 0; // 🔧 重置 generate_end 时间戳
     state.firstInit = true;
@@ -1638,13 +1727,158 @@ export function useLiveKit() {
         }
     }
 
+    function getCurrentRoundTimingAnchor() {
+        const idx = state.pendingRoundIndex >= 0 ? state.pendingRoundIndex : state.audioRounds.length - 1;
+        if (idx < 0) return null;
+
+        const round = state.audioRounds[idx];
+        if (!round) return null;
+
+        const candidates = [round.actualPlayAt, round.firstPlayAt, round.firstPacketAt, round.audioStartSignalAt].filter(
+            v => typeof v === 'number' && Number.isFinite(v)
+        );
+
+        if (!candidates.length) return null;
+        return Math.min(...candidates);
+    }
+
+    function getPlayEndGuardDelayMs() {
+        if (!state.currentRoundHasAudio) return 0;
+
+        const config = getSilenceConfig();
+        const minGuard = config.minPlayEndGuard || 0;
+        if (minGuard <= 0) return 0;
+
+        const anchor = getCurrentRoundTimingAnchor();
+        if (!anchor) return 0;
+
+        const elapsed = performance.now() - anchor;
+        return elapsed >= minGuard ? 0 : Math.ceil(minGuard - elapsed);
+    }
+
+    function resolveRoundId(roundId = null) {
+        if (Number.isInteger(roundId) && roundId > 0) return roundId;
+        if (Number.isInteger(state.currentGenerateRoundId) && state.currentGenerateRoundId > 0) {
+            return state.currentGenerateRoundId;
+        }
+        return null;
+    }
+
+    function clearPendingNoAudioTimer(reason = '') {
+        if (pendingNoAudioTimer) {
+            clearTimeout(pendingNoAudioTimer);
+            pendingNoAudioTimer = null;
+        }
+        if (state.pendingNoAudioRoundId !== null) {
+            console.log(`🧹 [${formatSyncedTimestamp()}] 清理 no-audio 定时器`, {
+                reason,
+                roundId: state.pendingNoAudioRoundId
+            });
+        }
+        state.pendingNoAudioRoundId = null;
+        state.pendingNoAudioDueAt = 0;
+    }
+
+    function scheduleNoAudioPlayEnd(roundId = null, reason = 'generate_end 后未检测到音频') {
+        const targetRoundId = resolveRoundId(roundId);
+        clearPendingNoAudioTimer('重建 no-audio 定时器');
+        state.pendingNoAudioRoundId = targetRoundId;
+        state.pendingNoAudioDueAt = performance.now() + NO_AUDIO_GRACE_MS;
+
+        console.warn(
+            `%c⏳ [${formatSyncedTimestamp()}] 启动 no-audio 保护窗口 ${NO_AUDIO_GRACE_MS}ms`,
+            'color: #ff9800; font-weight: bold; font-size: 13px',
+            {
+                roundId: targetRoundId,
+                reason
+            }
+        );
+
+        pendingNoAudioTimer = setTimeout(() => {
+            pendingNoAudioTimer = null;
+            const activeRoundId = resolveRoundId();
+            const roundMismatch =
+                Number.isInteger(targetRoundId) &&
+                Number.isInteger(activeRoundId) &&
+                targetRoundId !== activeRoundId;
+            if (roundMismatch) {
+                console.log(
+                    `⏭️ [${formatSyncedTimestamp()}] no-audio 定时器轮次不匹配，跳过`,
+                    {
+                        timerRoundId: targetRoundId,
+                        activeRoundId
+                    }
+                );
+                clearPendingNoAudioTimer('轮次已切换');
+                return;
+            }
+            if (!state.generateEnd || state.currentRoundHasAudio) {
+                clearPendingNoAudioTimer('检测到生成未结束或已有音频');
+                return;
+            }
+            if (Object.values(state.remoteAudioActive).some(v => v)) {
+                clearPendingNoAudioTimer('远端仍在说话');
+                return;
+            }
+            if (state.status === 'talking') {
+                clearPendingNoAudioTimer('状态仍为 talking');
+                return;
+            }
+            state.status = 'listening';
+            sendPlayEnd(`no-audio 超时 ${NO_AUDIO_GRACE_MS}ms`, false, targetRoundId);
+        }, NO_AUDIO_GRACE_MS);
+    }
+
     /**
      * 发送 play_end 信号并设置防护标记
      */
-    function sendPlayEnd(reason = '音频播放结束') {
-        sendText('<state><play_end>');
+    function sendPlayEnd(reason = '音频播放结束', bypassGuard = false, roundId = null) {
+        if (!bypassGuard) {
+            const guardDelay = getPlayEndGuardDelayMs();
+            if (guardDelay > 0) {
+                if (pendingPlayEndTimer) {
+                    clearTimeout(pendingPlayEndTimer);
+                    pendingPlayEndTimer = null;
+                }
+
+                console.warn(
+                    `%c⏳ [${formatSyncedTimestamp()}] play_end 最短播放保护生效，延迟 ${guardDelay}ms 后发送`,
+                    'color: #ff9800; font-weight: bold; font-size: 13px',
+                    {
+                        reason,
+                        mode: state.mode,
+                        currentStatus: state.status,
+                        generateEnd: state.generateEnd
+                    }
+                );
+
+                pendingPlayEndTimer = setTimeout(() => {
+                    pendingPlayEndTimer = null;
+                    sendPlayEnd(`${reason}（最短播放保护 ${guardDelay}ms）`, true, roundId);
+                }, guardDelay);
+                return;
+            }
+        }
+
+        if (!state.room || !state.connected) {
+            console.warn('⚠️ room 未连接，跳过发送 play_end', {
+                reason,
+                hasRoom: !!state.room,
+                connected: state.connected
+            });
+            return;
+        }
+
+        const effectiveRoundId = resolveRoundId(roundId);
+        const playEndMessage = Number.isInteger(effectiveRoundId)
+            ? `<state><play_end:${effectiveRoundId}>`
+            : '<state><play_end>';
+
+        sendText(playEndMessage);
         state.playEndSent = true;
         state.playEndTimestamp = performance.now();
+        state.playEndRoundId = effectiveRoundId;
+        clearPendingNoAudioTimer('发送 play_end');
 
         // 使用醒目的样式打印日志
         console.log(
@@ -1656,6 +1890,7 @@ export function useLiveKit() {
             'color: #ff0000; font-weight: bold; font-size: 16px; background: #fff3cd; padding: 4px 8px;'
         );
         console.log(`%c   原因: ${reason}`, 'color: #ff0000; font-weight: bold; font-size: 14px');
+        console.log(`%c   轮次: ${effectiveRoundId ?? 'N/A'}`, 'color: #ff0000; font-weight: bold; font-size: 14px');
         console.log(`%c   当前状态: ${state.status} → listening`, 'color: #ff0000; font-weight: bold; font-size: 14px');
         console.log(
             `%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
@@ -1700,6 +1935,7 @@ export function useLiveKit() {
             state.remoteAudioActive[sid] = true;
             // 标记本轮有音频
             state.currentRoundHasAudio = true;
+            clearPendingNoAudioTimer('speaking=true 收到实际音频');
             // 记录首包音频时间
             markFirstPacket(participant);
 
@@ -2153,16 +2389,44 @@ export function useLiveKit() {
         }
     }
 
+    function unsubscribeParticipantSpeaking(sid) {
+        const listener = participantSpeakingListeners.get(sid);
+        if (!listener) return;
+
+        try {
+            if (typeof listener.participant?.off === 'function') {
+                listener.participant.off(ParticipantEvent.IsSpeakingChanged, listener.handler);
+            }
+        } catch (error) {
+            console.warn(`⚠️ 取消 speaking 监听失败: ${sid}`, error);
+        } finally {
+            participantSpeakingListeners.delete(sid);
+            delete state.remoteAudioActive[sid];
+        }
+    }
+
     function subscribeParticipant(p) {
+        if (!p?.sid) return;
+
+        // 防止重复订阅导致 speaking 事件双触发
+        if (participantSpeakingListeners.has(p.sid)) {
+            return;
+        }
+
         // 初始化状态
         state.remoteAudioActive[p.sid] = false;
         console.log(`🎯 [${formatSyncedTimestamp()}] 订阅远端参与者说话事件:`, {
             participant: p.identity,
             sid: p.sid
         });
-        p.on(ParticipantEvent.IsSpeakingChanged, speaking => {
+        const speakingHandler = speaking => {
             handleSpeakingChanged(p, speaking);
+        };
+        participantSpeakingListeners.set(p.sid, {
+            participant: p,
+            handler: speakingHandler
         });
+        p.on(ParticipantEvent.IsSpeakingChanged, speakingHandler);
     }
     /**
      * 加入房间（先 connect 再拿轨道）
@@ -2253,18 +2517,24 @@ export function useLiveKit() {
         timer = null;
         state.generateEnd = false;
         state.generateEndTimestamp = 0; // 🔧 重置 generate_end 时间戳
+        state.lastPlayEndAckTimestamp = 0;
         state.firstInit = true;
         state.modelInitialized = false; // 重置模型初始化状态
         state.initConfig = initConfig; // 🔧 使用传入的初始化配置（避免时序竞争）
         state.muteRemoteAudio = false; // 重置静音状态
         state.playEndSent = false; // 重置 play_end 防护标记
         state.playEndTimestamp = 0;
+        state.playEndRoundId = null;
         state.currentRoundHasAudio = false; // 重置音频标记
+        state.currentGenerateRoundId = null;
         state.mode = mode; // 保存当前通话模式
 
         silenceTimers.forEach(clearTimeout);
         silenceTimers.clear();
         audioEndConfirmCount.clear(); // 清空确认计数
+        clearPendingNoAudioTimer('joinRoom 初始化清理');
+        recentStateEventAt.clear();
+        participantSpeakingListeners.clear();
 
         // 清除之前的无机器人检测定时器
         if (noRobotTimer) {
@@ -2702,7 +2972,7 @@ export function useLiveKit() {
                 state.remoteTracks[sid] = state.remoteTracks[sid].filter(t => t !== track);
                 if (!state.remoteTracks[sid].length) {
                     delete state.remoteTracks[sid];
-                    delete state.remoteAudioActive[sid];
+                    unsubscribeParticipantSpeaking(sid);
                 }
             }
             // if (track.kind === 'audio') {
@@ -2715,7 +2985,7 @@ export function useLiveKit() {
         room.on(RoomEvent.ParticipantDisconnected, participant => {
             const sid = participant.sid;
             delete state.remoteTracks[sid];
-            delete state.remoteAudioActive[sid];
+            unsubscribeParticipantSpeaking(sid);
             if (onCleanup) onCleanup([sid]);
         });
 
@@ -2784,12 +3054,21 @@ export function useLiveKit() {
                 console.log('🧪 已过滤测试消息: 发送首响音频成功');
                 return;
             }
-            if (msg.message.includes('<state><audio_start>')) {
+
+            if (shouldIgnoreDuplicateStateEvent(msg.message)) {
+                return;
+            }
+
+            const stateEvent = parseStateEvent(msg.message);
+            const stateName = stateEvent?.name || '';
+            const stateRoundId = stateEvent?.roundId;
+
+            if (stateName === 'audio_start') {
                 console.log('%c返回聊天数据11111：' + formatSyncedTimestamp(), 'color: red; font-size: 30px');
             }
 
             // 处理模型初始化成功
-            if (msg.message.includes('<state><model_init_success>')) {
+            if (stateName === 'model_init_success') {
                 console.log('🎉 收到模型初始化成功信号', state.initConfig);
                 state.modelInitialized = true;
                 state.status = 'initializing'; // 🔧 修正：应该是 initializing 而不是 connecting
@@ -2996,22 +3275,25 @@ export function useLiveKit() {
             }
 
             // 处理模型初始化失败
-            if (msg.message.includes('<state><model_init_failed>')) {
+            if (stateName === 'model_init_failed') {
                 console.error('❌ 模型初始化失败');
                 state.modelInitialized = false;
                 state.status = 'init_failed';
                 return;
             }
 
-            if (msg.message.includes('<state><session_init>') && state.firstInit) {
+            if (stateName === 'session_init' && state.firstInit) {
                 // 模型完成初始化
                 state.status = 'listening';
                 state.generateEnd = false; // 重置生成结束状态
                 state.generateEndTimestamp = 0; // 🔧 重置 generate_end 时间戳
+                state.currentGenerateRoundId = null;
+                state.playEndRoundId = null;
+                clearPendingNoAudioTimer('session_init');
                 console.log('🔄 收到 session_init，状态切换为 listening');
                 state.firstInit = false;
                 localStorage.setItem('initStatus', 'done');
-            } else if (msg.message.includes('<state><vad_end>')) {
+            } else if (stateName === 'vad_end') {
                 state.status = 'thinking';
                 console.log(
                     `%c🤔 [${formatSyncedTimestamp()}] 收到 vad_end，状态切换为 thinking`,
@@ -3021,8 +3303,10 @@ export function useLiveKit() {
                 // 重置 play_end 防护标记，允许新一轮对话的音频播放
                 state.playEndSent = false;
                 state.playEndTimestamp = 0;
+                state.playEndRoundId = null;
                 state.generateEnd = false; // 🔥 重置生成结束标记，避免旧标记干扰新轮次
                 state.generateEndTimestamp = 0; // 🔧 重置 generate_end 时间戳
+                clearPendingNoAudioTimer('vad_end 新轮开始');
                 console.log('🔄 收到 vad_end，重置 play_end 防护标记和 generateEnd 标记');
 
                 // 如果之前被打断导致静音，现在解除静音，允许下一轮对话播放音频
@@ -3040,7 +3324,36 @@ export function useLiveKit() {
                         }
                     }
                 }
-            } else if (msg.message.includes('<state><generate_start>')) {
+            } else if (stateName === 'round_start') {
+                if (Number.isInteger(stateRoundId)) {
+                    state.currentGenerateRoundId = stateRoundId;
+                }
+                console.log(`🧭 收到 round_start，当前轮次更新为 ${state.currentGenerateRoundId ?? 'N/A'}`);
+            } else if (stateName === 'generate_start') {
+                const now = performance.now();
+                const timeSincePlayEndAck = state.lastPlayEndAckTimestamp
+                    ? now - state.lastPlayEndAckTimestamp
+                    : Infinity;
+                const roundId = Number.isInteger(stateRoundId)
+                    ? stateRoundId
+                    : Number.isInteger(state.currentGenerateRoundId)
+                      ? state.currentGenerateRoundId + 1
+                      : null;
+                if (
+                    state.status === 'listening' &&
+                    !state.localAudioActive &&
+                    timeSincePlayEndAck < GENERATE_START_COOLDOWN_AFTER_PLAY_END_ACK_MS
+                ) {
+                    console.warn(
+                        `%c⚠️ [${formatSyncedTimestamp()}] 忽略疑似自触发 generate_start（距 play_end_success ${timeSincePlayEndAck.toFixed(0)}ms）`,
+                        'color: #ff8800; font-weight: bold; font-size: 14px;'
+                    );
+                    return;
+                }
+
+                state.currentGenerateRoundId = roundId;
+                clearPendingNoAudioTimer('收到 generate_start');
+
                 // 不在这里切换到 talking，等待 audio_start
                 state.messageIndex++;
                 state.chatMessages.push({
@@ -3061,13 +3374,15 @@ export function useLiveKit() {
                 state.generateEnd = false; // 重置生成结束状态
                 state.generateEndTimestamp = 0; // 🔧 重置 generate_end 时间戳
                 state.currentRoundHasAudio = false; // 重置音频标记
+                state.playEndRoundId = null;
                 console.log(
-                    `%c📝 [${formatSyncedTimestamp()}] 收到 generate_start，开始生成回答 (重置 generateEnd=false, currentRoundHasAudio=false)`,
+                    `%c📝 [${formatSyncedTimestamp()}] 收到 generate_start，开始生成回答 (round=${roundId ?? 'N/A'})`,
                     'color: #00bfff; font-weight: bold; font-size: 16px; background: #1a1a1a; padding: 4px 8px;'
                 );
                 // 新开一轮，记录生成开始时间
                 state.audioRounds.push({
                     round: state.audioRounds.length,
+                    roundId,
                     participantSid: undefined,
                     generateStartAt: performance.now(),
                     audioStartSignalAt: undefined,
@@ -3085,26 +3400,82 @@ export function useLiveKit() {
                 }
 
                 state.pendingRoundIndex = state.audioRounds.length - 1;
-            } else if (msg.message.includes('<state><audio_start>')) {
-                // 收到音频开始信号，提前将状态切为 talking，避免首帧说话时 UI 滞后
-                state.currentRoundHasAudio = true; // 标记有音频
-                const prevStatus = state.status || '空';
-                if (['thinking', 'connecting', 'initializing', ''].includes(state.status)) {
-                    state.status = 'talking';
-                    console.log(`▶️ audio_start 提前切换状态 ${prevStatus} → talking`);
+            } else if (stateName === 'audio_start' || stateName === 'tts_first_pcm') {
+                const roundId = Number.isInteger(stateRoundId) ? stateRoundId : null;
+                const activeRoundId = resolveRoundId();
+                if (Number.isInteger(roundId) && Number.isInteger(activeRoundId) && roundId !== activeRoundId) {
+                    console.warn(
+                        `%c⏭️ [${formatSyncedTimestamp()}] 忽略过期 ${stateName}（轮次不匹配）`,
+                        'color: #ffaa00; font-weight: bold; font-size: 14px',
+                        {
+                            eventRoundId: roundId,
+                            activeRoundId
+                        }
+                    );
+                    return;
+                }
+
+                if (Number.isInteger(roundId)) {
+                    state.currentGenerateRoundId = roundId;
+                }
+                state.currentRoundHasAudio = true;
+                clearPendingNoAudioTimer(`收到 ${stateName}`);
+
+                if (stateName === 'audio_start') {
+                    const prevStatus = state.status || '空';
+                    if (['thinking', 'listening', 'connecting', 'initializing', ''].includes(state.status)) {
+                        state.status = 'talking';
+                        console.log(`▶️ audio_start 提前切换状态 ${prevStatus} → talking (round=${roundId ?? 'N/A'})`);
+                    } else {
+                        console.log('🔊 收到 audio_start，标记本轮有音频，等待实际音频播放检测...');
+                    }
+                    if (state.pendingRoundIndex >= 0) {
+                        const round = state.audioRounds[state.pendingRoundIndex];
+                        if (!round.audioStartSignalAt) round.audioStartSignalAt = performance.now();
+                    }
                 } else {
-                    console.log('🔊 收到 audio_start，标记本轮有音频，等待实际音频播放检测...');
+                    console.log(`🎧 收到 tts_first_pcm，确认首包PCM已下发 (round=${roundId ?? 'N/A'})`);
                 }
-                if (state.pendingRoundIndex >= 0) {
-                    const round = state.audioRounds[state.pendingRoundIndex];
-                    if (!round.audioStartSignalAt) round.audioStartSignalAt = performance.now();
+            } else if (stateName === 'generate_no_audio') {
+                const roundId = Number.isInteger(stateRoundId) ? stateRoundId : resolveRoundId();
+                if (Number.isInteger(roundId)) {
+                    state.currentGenerateRoundId = roundId;
                 }
-            } else if (msg.message.includes('<state><generate_end>')) {
+                state.currentRoundHasAudio = false;
+                console.warn(
+                    `%c⚠️ [${formatSyncedTimestamp()}] 收到 generate_no_audio，进入 no-audio 保护窗口`,
+                    'color: orange; font-weight: bold; font-size: 14px',
+                    {
+                        roundId,
+                        status: state.status,
+                        generateEnd: state.generateEnd
+                    }
+                );
+                if (state.generateEnd && state.status !== 'talking') {
+                    scheduleNoAudioPlayEnd(roundId, '收到 generate_no_audio');
+                }
+            } else if (stateName === 'generate_end') {
+                const roundId = Number.isInteger(stateRoundId) ? stateRoundId : resolveRoundId();
+                const activeRoundId = resolveRoundId();
+                if (Number.isInteger(roundId) && Number.isInteger(activeRoundId) && roundId !== activeRoundId) {
+                    console.warn(
+                        `%c⏭️ [${formatSyncedTimestamp()}] 忽略过期 generate_end（轮次不匹配）`,
+                        'color: #ffaa00; font-weight: bold; font-size: 14px',
+                        {
+                            eventRoundId: roundId,
+                            activeRoundId
+                        }
+                    );
+                    return;
+                }
+                if (Number.isInteger(roundId)) {
+                    state.currentGenerateRoundId = roundId;
+                }
                 // 单轮对话结束，标记生成结束
                 state.generateEnd = true;
                 state.generateEndTimestamp = performance.now(); // 🔧 记录 generate_end 接收时间
                 console.log(
-                    `%c✅✅✅ [${formatSyncedTimestamp()}] 🚨 收到 generate_end，标记生成结束 🚨`,
+                    `%c✅✅✅ [${formatSyncedTimestamp()}] 🚨 收到 generate_end，标记生成结束 (round=${roundId ?? 'N/A'}) 🚨`,
                     'color: #00ff00; font-weight: bold; font-size: 20px; background: #ff0000; padding: 10px; border: 3px solid #ffff00;'
                 );
                 console.log(
@@ -3143,20 +3514,20 @@ export function useLiveKit() {
                         是否为空轮次: !state.currentRoundHasAudio && state.status === 'thinking'
                     }
                 );
-                if (!state.currentRoundHasAudio && state.status === 'thinking') {
+                if (!state.currentRoundHasAudio && ['thinking', 'listening'].includes(state.status)) {
                     console.warn(
-                        `%c⚠️ [${formatSyncedTimestamp()}] 检测到空轮次（无音频），直接发送 play_end`,
+                        `%c⚠️ [${formatSyncedTimestamp()}] 检测到潜在空轮次（无音频），启动 no-audio 保护窗口`,
                         'color: orange; font-weight: bold; font-size: 14px',
                         {
                             currentStatus: state.status,
                             hasAudio: state.currentRoundHasAudio,
                             generateEnd: state.generateEnd,
-                            说明: '后端发送 generate_start 后立即发送 generate_end，没有音频播放'
+                            roundId,
+                            graceMs: NO_AUDIO_GRACE_MS
                         }
                     );
-                    state.status = 'listening';
-                    sendPlayEnd('空轮次，无音频');
-                    return; // 处理完空轮次，直接返回
+                    scheduleNoAudioPlayEnd(roundId, 'generate_end 检测到无音频');
+                    return;
                 }
 
                 // 🔥 优化：立即检查音频播放状态，无需等待
@@ -3296,26 +3667,45 @@ export function useLiveKit() {
                 } else {
                     console.log(`⏸️ generate_end时状态非talking（当前: ${state.status}），无需处理`);
                 }
-            } else if (msg.message.includes('<state><audit_stop>')) {
+            } else if (stateName === 'audit_stop') {
                 // 命中安审规则
                 state.chatMessages[state.messageIndex].text = '换一个问题聊吧～';
                 state.status = 'forbidden';
                 console.log('🚫 收到 audit_stop，状态切换为 forbidden');
-            } else if (msg.message.includes('<state><robot_exit>')) {
+            } else if (stateName === 'robot_exit') {
                 // 机器人退出信号
                 state.status = 'robot_exit';
                 console.log('🚪 收到 robot_exit，机器人已退出，准备挂断通话');
-            } else if (msg.message.includes('<state><play_end_success>')) {
+            } else if (stateName === 'play_end_success') {
                 // 收到后端播放结束确认信号
                 const timestamp = formatSyncedTimestamp();
+                const ackRoundId = Number.isInteger(stateRoundId) ? stateRoundId : null;
                 if (state.playEndSent) {
+                    if (
+                        Number.isInteger(ackRoundId) &&
+                        Number.isInteger(state.playEndRoundId) &&
+                        ackRoundId !== state.playEndRoundId
+                    ) {
+                        console.warn(
+                            `%c⚠️ [${timestamp}] play_end_success 轮次不匹配，忽略`,
+                            'color: orange; font-weight: bold; font-size: 14px',
+                            {
+                                ackRoundId,
+                                expectedRoundId: state.playEndRoundId
+                            }
+                        );
+                        return;
+                    }
                     // 前端已发送 play_end，收到确认后切换状态
                     state.status = 'listening';
                     // 重置 play_end 防护标记，为下一轮对话做准备
                     state.playEndSent = false;
                     state.playEndTimestamp = 0;
+                    state.playEndRoundId = null;
+                    state.lastPlayEndAckTimestamp = performance.now();
+                    clearPendingNoAudioTimer('收到 play_end_success');
                     console.log(
-                        `%c✅ [${timestamp}] 收到 play_end_success，状态切换为 listening，已重置 playEndSent`,
+                        `%c✅ [${timestamp}] 收到 play_end_success，状态切换为 listening，已重置 playEndSent (round=${ackRoundId ?? 'N/A'})`,
                         'color: #00ff00; font-weight: bold; font-size: 16px; background: #1a1a1a; padding: 4px 8px;'
                     );
                 } else {
@@ -3325,13 +3715,14 @@ export function useLiveKit() {
                         'color: orange; font-weight: bold; font-size: 14px',
                         {
                             currentStatus: state.status,
+                            ackRoundId,
                             playEndSent: state.playEndSent,
                             generateEnd: state.generateEnd,
                             说明: '可能是后端误发或时序问题，为防止状态混乱不做处理'
                         }
                     );
                 }
-            } else if (msg.message.includes('<state><session_break>')) {
+            } else if (stateName === 'session_break') {
                 // 收到后端打断成功信号，执行前端打断操作
                 const timestamp = formatSyncedTimestamp();
                 console.log(`✅ [${timestamp}] 收到 <state><session_break> 信号，开始执行前端打断操作`);
@@ -3453,6 +3844,11 @@ export function useLiveKit() {
             // 🔥 修复时序问题：连接成功后立即设置 connected = true
             // 这样后端发送的 model_init_success 信号触发的 sendText() 才能正常发送
             state.connected = true;
+
+            // 监听本地说话状态（用于抑制 AI 自触发打断）
+            room.localParticipant.on(ParticipantEvent.IsSpeakingChanged, speaking => {
+                state.localAudioActive = speaking;
+            });
 
             // 🔥 计时点1：房间连接完成
             timings.roomConnected = performance.now();
@@ -4342,6 +4738,9 @@ export function useLiveKit() {
 
         state.generateEnd = false; // 重置生成结束状态
         state.generateEndTimestamp = 0; // 🔧 重置 generate_end 时间戳
+        state.currentGenerateRoundId = null;
+        state.playEndRoundId = null;
+        clearPendingNoAudioTimer('sendAndLeave');
 
         // 1. 发送消息
         try {
@@ -4396,6 +4795,11 @@ export function useLiveKit() {
         silenceTimers.forEach(clearTimeout);
         silenceTimers.clear();
         audioEndConfirmCount.clear(); // 清空确认计数
+        if (pendingPlayEndTimer) {
+            clearTimeout(pendingPlayEndTimer);
+            pendingPlayEndTimer = null;
+        }
+        clearPendingNoAudioTimer('handleInterfaceStop');
 
         // 5. 设置延迟退出
         setTimeout(() => {
@@ -4410,6 +4814,9 @@ export function useLiveKit() {
         // 立即切换状态为 listening
         state.status = 'listening';
         state.generateEnd = true;
+        state.currentRoundHasAudio = false;
+        state.playEndRoundId = null;
+        clearPendingNoAudioTimer('handleInterfaceBreak 状态重置');
 
         // 设置静音标记，阻止后续音频播放，直到收到下一个 vad_end
         state.muteRemoteAudio = true;
@@ -4450,6 +4857,11 @@ export function useLiveKit() {
         silenceTimers.forEach(clearTimeout);
         silenceTimers.clear();
         audioEndConfirmCount.clear(); // 清空确认计数
+        if (pendingPlayEndTimer) {
+            clearTimeout(pendingPlayEndTimer);
+            pendingPlayEndTimer = null;
+        }
+        clearPendingNoAudioTimer('handleInterfaceBreak');
 
         console.log(`✅ [${timestamp}] 打断操作完成，状态已切换为 listening，远端音频已静音`);
     }
@@ -4840,6 +5252,11 @@ export function useLiveKit() {
         silenceTimers.forEach(clearTimeout);
         silenceTimers.clear();
         audioEndConfirmCount.clear(); // 清空确认计数
+        if (pendingPlayEndTimer) {
+            clearTimeout(pendingPlayEndTimer);
+            pendingPlayEndTimer = null;
+        }
+        clearPendingNoAudioTimer('leaveRoom');
 
         // 清除无机器人检测定时器
         if (noRobotTimer) {
@@ -4874,6 +5291,13 @@ export function useLiveKit() {
                 } catch {}
             });
         if (onCleanup) onCleanup();
+
+        // 清理参与者说话监听，防止下次会话重复订阅
+        for (const sid of participantSpeakingListeners.keys()) {
+            unsubscribeParticipantSpeaking(sid);
+        }
+        participantSpeakingListeners.clear();
+        recentStateEventAt.clear();
 
         // 3. 卸载所有事件，断开连接
         try {

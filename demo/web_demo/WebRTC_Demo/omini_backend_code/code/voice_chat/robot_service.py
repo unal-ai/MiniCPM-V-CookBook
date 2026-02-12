@@ -26,7 +26,7 @@ logger = get_enhanced_logger('voice_chat')
 class Mini_Server:
     def __init__(self, stop_event: asyncio.Event, liveKitRoom: LiveKitRoom, 
     audio_output_queue: asyncio.Queue, text_output_queue: asyncio.Queue, 
-    first_tts: asyncio.Event):
+    first_tts: asyncio.Event, shared_state: SharedSessionState):
         self.liveKitRoom = liveKitRoom
         self.stop_event = stop_event
 
@@ -38,6 +38,7 @@ class Mini_Server:
         self.audio_output_queue = audio_output_queue
         self.text_output_queue = text_output_queue
         self.first_tts = first_tts
+        self.shared_state = shared_state
 
     async def server(self, source: rtc.AudioSource, model_generating_flag: asyncio.Event) -> None:
         asyncio.create_task(self.output_audio(source, model_generating_flag))
@@ -95,7 +96,8 @@ class Mini_Server:
                         
                         # 标记首次音频开始
                         if self.first_tts.is_set():
-                            self.text_output_queue.put_nowait("<state><audio_start>")
+                            current_round_id = await self.shared_state.get_round()
+                            self.text_output_queue.put_nowait(f"<state><audio_start:{current_round_id}>")
                         
                         # 拼接新数据与剩余音频
                         if remaining_audio is not None:
@@ -110,6 +112,8 @@ class Mini_Server:
                             await source.capture_frame(audio_frame)
                             
                             if self.first_tts.is_set():
+                                current_round_id = await self.shared_state.get_round()
+                                self.text_output_queue.put_nowait(f"<state><tts_first_pcm:{current_round_id}>")
                                 self.text_output_queue.put_nowait(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - 发送首响音频成功")
                                 self.first_tts.clear()
                             
@@ -127,6 +131,11 @@ class Mini_Server:
                             padded_audio[:len(remaining_audio)] = remaining_audio
                             np.copyto(audio_data, padded_audio)
                             await source.capture_frame(audio_frame)
+                            if self.first_tts.is_set():
+                                current_round_id = await self.shared_state.get_round()
+                                self.text_output_queue.put_nowait(f"<state><tts_first_pcm:{current_round_id}>")
+                                self.text_output_queue.put_nowait(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - 发送首响音频成功")
+                                self.first_tts.clear()
                             frame_count += 1
                             remaining_audio = None
                             logger.debug(f"发送填充后的剩余音频")
@@ -190,7 +199,8 @@ async def room_start_monitor(session_id: str, liveKitToken: str, request: LoginR
             liveKitRoom=liveKit_room,
             audio_output_queue=audio_output_queue,
             text_output_queue=text_output_queue,
-            first_tts=first_tts)
+            first_tts=first_tts,
+            shared_state=shared_state)
         
         # 启动模型服务逻辑（非阻塞）
         await mini_server.server(source, model_generating_flag)

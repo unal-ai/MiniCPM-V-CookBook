@@ -66,11 +66,11 @@
 
 <script setup>
     import { ref, reactive, watch, nextTick, onBeforeUnmount } from 'vue';
-    import { useLiveKit, registerCleanup } from '@/hooks/useLiveKitStatic';
+    import { useLiveKitStatic, registerCleanupStatic } from '@/hooks/useLiveKitStatic';
     import { getRtcToken, logoutRtc } from '@/apis';
     import { ElMessage } from 'element-plus';
 
-    const { state, joinRoom, sendText, sendAndLeave, STATIC_MEDIA_CONFIG } = useLiveKit();
+    const { state, joinRoom, sendText, sendAndLeave, STATIC_MEDIA_CONFIG } = useLiveKitStatic();
 
     // 配置项
     const audioFilePath = ref(STATIC_MEDIA_CONFIG.audioFilePath);
@@ -187,7 +187,7 @@
         sendAndLeave(JSON.stringify(stopMessage));
 
         // 清理资源
-        registerCleanup();
+        registerCleanupStatic();
 
         if (token.value) {
             try {
@@ -201,7 +201,7 @@
     }
 
     // 清理函数
-    registerCleanup((sids = []) => {
+    registerCleanupStatic((sids = []) => {
         const list = sids.length ? sids : Object.keys(remoteAudioRefs);
         list.forEach(sid => {
             const el = remoteAudioRefs[sid];
@@ -215,7 +215,7 @@
         if (connected.value) {
             stopDemo();
         }
-        registerCleanup();
+        registerCleanupStatic();
     });
 </script>
 

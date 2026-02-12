@@ -38,6 +38,7 @@ class MiniCpmModel ():
      self.play_end_event.set()
      self.shared_state = shared_state
      self.model_generating_flag = model_generating_flag
+     self.active_round_id = None
 
    async def model_init(self):
         try:
@@ -178,9 +179,12 @@ class MiniCpmModel ():
           logger.info(f"发送Omni generate请求到: {api_url}, 请求参数: {request_data}")
           
           self.play_end_event.clear()
+          current_round_id = await self.shared_state.increment_round()
+          self.active_round_id = current_round_id
+          await self.text_output_queue.put(f"<state><round_start:{current_round_id}>")
+          await self.text_output_queue.put(f"<state><generate_start:{current_round_id}>")
           send_first_chunk = False
           # 流式请求
-          await self.shared_state.increment_round()
           async for chunk in self.http_util.stream_post(
               url=api_url,
               json_data=request_data,
@@ -190,6 +194,7 @@ class MiniCpmModel ():
             if not send_first_chunk:
                 self.first_tts.set()
                 await self.text_output_queue.put(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - <state><generate_first_chunk>")
+                await self.text_output_queue.put(f"<state><generate_first_chunk:{current_round_id}>")
                 send_first_chunk = True
             parsed_data = self._parse_stream_chunk(chunk)
             if parsed_data:
@@ -227,7 +232,7 @@ class MiniCpmModel ():
              # 问题回答结束，重置vad检测的标志位
             self.vad_stream_started = False
             self.play_end_event.set()
-            await self.shared_state.increment_round()
+            self.active_round_id = await self.shared_state.increment_round()
 
    async def streaming_stop(self, session_id: str):
         try:

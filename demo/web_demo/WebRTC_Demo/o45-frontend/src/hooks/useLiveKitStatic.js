@@ -66,7 +66,7 @@ const EXTRA_SAFETY_DELAY_MS = 300;
 const silenceTimers = new Map();
 
 let onCleanup = null;
-export function registerCleanup(fn) {
+export function registerCleanupStatic(fn) {
     onCleanup = fn;
 }
 
@@ -450,7 +450,7 @@ async function createStaticVideoTrack() {
     }
 }
 
-export function useLiveKit() {
+export function useLiveKitStatic() {
     // 轮次与时间点记录
     function ensureRoundForParticipant(participantSid) {
         const last = state.audioRounds[state.audioRounds.length - 1];

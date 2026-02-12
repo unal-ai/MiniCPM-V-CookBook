@@ -235,16 +235,6 @@
 
     const getLabel = () => {
         let text;
-        if (props.mode === 'duplex') {
-            if (props.status === 'connecting' || props.status === 'initializing') {
-                text = t('connecting');
-            } else {
-                text = t('inCall');
-            }
-            label.value = text;
-            return;
-        }
-
         switch (props.status) {
             case 'connecting':
                 text = t('connecting');
@@ -646,7 +636,7 @@
 
                 // 双工模式：其他状态
                 &.duplex-other {
-                    color: #ffffff;
+                    color: #6893fb;
                 }
 
                 // 视频模式样式

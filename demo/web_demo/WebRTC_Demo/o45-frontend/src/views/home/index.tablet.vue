@@ -13,18 +13,18 @@
             <!-- 中间：实时语音通话/视频通话导航 -->
             <div class="header-nav">
                 <div class="toolbar-nav">
-                    <el-tooltip :content="t('requiresSimplex')" placement="bottom" :disabled="cppMode !== 'duplex'">
+                    <el-tooltip :content="t('menuTabVoice')" placement="bottom" :disabled="true">
                         <div
-                            :class="['nav-item', { active: activeTab === 'voice', 'disabled-tab': cppMode === 'duplex' }]"
-                            @click="cppMode !== 'duplex' && handleClickTab('voice', 0)"
+                            :class="['nav-item', { active: activeTab === 'voice' }]"
+                            @click="handleClickTab('voice', 0)"
                         >
                             {{ t('menuTabVoice') }}
                         </div>
                     </el-tooltip>
-                    <el-tooltip :content="t('requiresDuplex')" placement="bottom" :disabled="cppMode !== 'simplex'">
+                    <el-tooltip :content="t('menuTabVideo')" placement="bottom" :disabled="true">
                         <div
-                            :class="['nav-item', { active: activeTab === 'video', 'disabled-tab': cppMode === 'simplex' }]"
-                            @click="cppMode !== 'simplex' && handleClickTab('video', 1)"
+                            :class="['nav-item', { active: activeTab === 'video' }]"
+                            @click="handleClickTab('video', 1)"
                         >
                             {{ t('menuTabVideo') }}
                         </div>
@@ -385,7 +385,7 @@
                 :theme="activeTab === 'video' && isCalling ? 'dark' : 'light'"
             />
             <div class="model-type" v-if="!isCalling">
-                {{ cppMode === 'simplex' ? t('simplexMode') : t('duplexMode') }}
+                {{ modelType === 'simplex' ? t('simplexMode') : t('duplexMode') }}
             </div>
             <div class="hd-type" v-if="isCalling && hdMode">
                 {{ t('hdModeLabel') }}
@@ -545,7 +545,7 @@
                     v-if="activeTab === 'voice'"
                     v-model:isCalling="isCalling"
                     v-model:loading="loading"
-                    model-type="simplex"
+                    :model-type="modelType"
                     @handleLogin="handleLogin"
                     @updateSessionId="handleUpdateSessionId"
                 />
@@ -554,7 +554,7 @@
                     v-else-if="activeTab === 'video'"
                     v-model:isCalling="isCalling"
                     v-model:loading="loading"
-                    model-type="duplex"
+                    :model-type="modelType"
                     @handleLogin="handleLogin"
                     @updateSessionId="handleUpdateSessionId"
                 />
@@ -622,7 +622,7 @@
 
     // 网络测速功能
     const { speedMbps, isTesting, startTesting, stopTesting } = useNetworkSpeed({
-        fileUrl: '/static/test.txt',
+        fileUrl: '/static/test.bin',
         fileSizeBytes: 500 * 1024, // 500 KB
         interval: 10000 // 每 10 秒检测一次
     });
@@ -656,7 +656,7 @@
 
     const loading = ref(false);
 
-    const modelType = ref(localStorage.getItem('modelType') || 'simplex'); // 单双工模式 'simplex' or 'duplex'
+    const modelType = ref(localStorage.getItem('modelType') || cppMode); // 单双工模式 'simplex' or 'duplex'
     const highRefreshCacheKey = 'highRefresh';
     const isHighRefresh = ref(false);
 
@@ -1016,11 +1016,6 @@
         if (isCalling.value) return;
         if (modelType.value === val) return;
         modelType.value = val;
-
-        // 如果切换到双工模式，且当前是语音通话，自动切换到视频通话
-        if (val === 'duplex' && activeTab.value === 'voice') {
-            changeTab('video', 1);
-        }
 
         ElMessage.success(t('modeSwitchSuccess'));
         localStorage.setItem('modelType', val);

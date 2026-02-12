@@ -112,7 +112,7 @@
     // const audioStream = AudioPlayer();
 
     // 使用静态媒体的 LiveKit hook
-    import { useLiveKit, registerCleanup } from '@/hooks/useLiveKitStatic';
+    import { useLiveKitStatic, registerCleanupStatic } from '@/hooks/useLiveKitStatic';
     import { resolveLivekitUrl } from '@/utils/rtcUrl';
 
     const {
@@ -127,7 +127,7 @@
         notifyStatusChange,
         setFixedAudioLocalPlayback,
         setFixedAudioLocalVolume
-    } = useLiveKit();
+    } = useLiveKitStatic();
 
     import useAudioStream from '@/audio-core/useAudioStream';
     let streamPlayer = null;
@@ -307,7 +307,7 @@
     );
 
     // 清理函数：接受一个 SID 数组（或空表示全部）
-    registerCleanup((sids = []) => {
+    registerCleanupStatic((sids = []) => {
         const list = sids.length ? sids : Object.keys(remoteAudioRefs);
         list.forEach(sid => {
             const el = remoteAudioRefs[sid];
@@ -488,7 +488,7 @@
         }
 
         // 页面销毁前也清理一次
-        registerCleanup();
+        registerCleanupStatic();
 
         // 重置远端音频静音状态
         if (isPageMuted.value) {
@@ -514,7 +514,7 @@
             staticMediaMode: true
         };
         sendAndLeave(JSON.stringify(obj));
-        registerCleanup();
+        registerCleanupStatic();
         await logoutRtc({
             token: token.value
         });

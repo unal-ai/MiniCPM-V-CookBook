@@ -1,6 +1,6 @@
 <template>
     <div class="home-page" :class="{ 'loading-mode': isLoadingMode }">
-        <div class="model-type">{{ cppMode === 'simplex' ? t('simplexMode') : t('duplexMode') }}</div>
+        <div class="model-type">{{ modelType === 'simplex' ? t('simplexMode') : t('duplexMode') }}</div>
         <!-- Header -->
         <div class="home-page-header">
             <div class="home-page-header-logo">
@@ -43,7 +43,7 @@
                         </el-option>
                     </el-select>
                 </div>
-                <!-- <div class="select-type">
+                <div class="select-type">
                     <div
                         :class="`${modelType === 'simplex' && 'active-type'} ${isCalling && 'disabled-select'}`"
                         @click="changeModelType('simplex')"
@@ -56,7 +56,7 @@
                     >
                         {{ t('duplexMode') }}
                     </div>
-                </div> -->
+                </div>
                 <div
                     v-if="isInternal"
                     class="restart-model"
@@ -324,27 +324,19 @@
         <div class="home-page-content">
             <!-- Collapsible Sidebar -->
             <div :class="`home-page-content-nav ${isCollapsed ? 'collapsed-nav' : ''}`">
-                <el-tooltip
-                    :content="t('requiresSimplex')"
-                    placement="right"
-                    :disabled="cppMode !== 'duplex'"
-                >
+                <el-tooltip :content="t('menuTabVoice')" placement="right" :disabled="true">
                     <div
-                        :class="`home-page-content-nav-item ${activeTab === 'voice' ? 'active-tab' : ''} ${cppMode === 'duplex' ? 'disabled-tab' : ''}`"
-                        @click="cppMode !== 'duplex' && handleClickTab('voice', 0)"
+                        :class="`home-page-content-nav-item ${activeTab === 'voice' ? 'active-tab' : ''}`"
+                        @click="handleClickTab('voice', 0)"
                     >
                         <SvgIcon name="voice-icon" class="nav-icon" />
                         <span class="nav-label">{{ t('menuTabVoice') }}</span>
                     </div>
                 </el-tooltip>
-                <el-tooltip
-                    :content="t('requiresDuplex')"
-                    placement="right"
-                    :disabled="cppMode !== 'simplex'"
-                >
+                <el-tooltip :content="t('menuTabVideo')" placement="right" :disabled="true">
                     <div
-                        :class="`home-page-content-nav-item ${activeTab === 'video' ? 'active-tab' : ''} ${cppMode === 'simplex' ? 'disabled-tab' : ''}`"
-                        @click="cppMode !== 'simplex' && handleClickTab('video', 1)"
+                        :class="`home-page-content-nav-item ${activeTab === 'video' ? 'active-tab' : ''}`"
+                        @click="handleClickTab('video', 1)"
                     >
                         <SvgIcon name="video-icon" class="nav-icon" />
                         <span class="nav-label">{{ t('menuTabVideo') }}</span>
@@ -409,7 +401,7 @@
                     v-if="activeTab === 'voice'"
                     v-model:isCalling="isCalling"
                     v-model:loading="loading"
-                    model-type="simplex"
+                    :model-type="modelType"
                     @handleLogin="handleLogin"
                     @updateSessionId="handleUpdateSessionId"
                 />
@@ -418,7 +410,7 @@
                     v-else-if="activeTab === 'video'"
                     v-model:isCalling="isCalling"
                     v-model:loading="loading"
-                    model-type="duplex"
+                    :model-type="modelType"
                     @handleLogin="handleLogin"
                     @updateSessionId="handleUpdateSessionId"
                 />
@@ -641,7 +633,7 @@
 
     // 网络测速功能
     const { speedMbps, isTesting, startTesting, stopTesting } = useNetworkSpeed({
-        fileUrl: '/static/test.txt',
+        fileUrl: '/static/test.bin',
         fileSizeBytes: 500 * 1024, // 500 KB
         interval: 10000 // 每 10 秒检测一次
     });
@@ -690,7 +682,7 @@
     const loading = ref(false);
 
     // KOL版本默认双工
-    const modelType = ref(localStorage.getItem('modelType') || 'duplex'); // 单双工模式 'simplex' or 'duplex'
+    const modelType = ref(localStorage.getItem('modelType') || cppMode); // 单双工模式 'simplex' or 'duplex'
 
     const visible = ref(false);
     const modeSwitchVisible = ref(false);
@@ -1057,11 +1049,6 @@
         if (isCalling.value) return;
         if (modelType.value === val) return;
         modelType.value = val;
-
-        // 如果切换到双工模式，且当前是语音通话，自动切换到视频通话
-        if (val === 'duplex' && activeTab.value === 'voice') {
-            changeTab('video', 1);
-        }
 
         ElMessage.success(t('modeSwitchSuccess'));
         localStorage.setItem('modelType', val);

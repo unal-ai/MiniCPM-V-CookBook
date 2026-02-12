@@ -345,6 +345,8 @@
     "watchWithFilter": true,
     "whenever": true,
     "ElMessage": true,
-    "useNetworkSpeed": true
+    "useNetworkSpeed": true,
+    "registerCleanupStatic": true,
+    "useLiveKitStatic": true
   }
 }

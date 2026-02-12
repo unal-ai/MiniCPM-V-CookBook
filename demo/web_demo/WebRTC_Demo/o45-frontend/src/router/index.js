@@ -13,7 +13,6 @@ export const router = createRouter({
 router.beforeEach((to, from, next) => {
     // 只对首页路由进行检查
     if (to.path === '/') {
-        const modelType = localStorage.getItem('modelType') || 'simplex';
         const type = to.query.type;
 
         // 1. 验证 type 参数：如果存在，只能是 '0' 或 '1'
@@ -29,19 +28,6 @@ router.beforeEach((to, from, next) => {
             return;
         }
 
-        // 2. 如果是双工模式，且尝试访问语音通话页面（type=0），则重定向到视频通话（type=1）
-        if (modelType === 'duplex' && type === '0') {
-            console.log('🚫 双工模式不支持语音通话，已自动重定向到视频通话');
-            next({
-                path: '/',
-                query: {
-                    ...to.query,
-                    type: '1' // 强制切换到视频通话
-                },
-                replace: true // 替换历史记录，避免用户点击后退按钮回到错误页面
-            });
-            return;
-        }
     }
 
     next();

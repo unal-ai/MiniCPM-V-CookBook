@@ -7,7 +7,7 @@
             :speed-mbps="speedMbps"
             :theme="activeTab === 'video' && isCalling ? 'dark' : 'light'"
         />
-        <div class="model-type" v-if="!isCalling">{{ cppMode === 'simplex' ? t('simplexMode') : t('duplexMode') }}</div>
+        <div class="model-type" v-if="!isCalling">{{ modelType === 'simplex' ? t('simplexMode') : t('duplexMode') }}</div>
         <div class="hd-type" v-if="isCalling && hdMode">
             {{ t('hdModeLabel') }}
         </div>
@@ -82,7 +82,7 @@
                 v-if="activeTab === 'voice'"
                 v-model:isCalling="isCalling"
                 v-model:loading="loading"
-                model-type="simplex"
+                :model-type="modelType"
                 @handleLogin="handleLogin"
                 @updateSessionId="handleUpdateSessionId"
             />
@@ -91,7 +91,7 @@
                 v-else
                 v-model:isCalling="isCalling"
                 v-model:loading="loading"
-                model-type="duplex"
+                :model-type="modelType"
                 @handleLogin="handleLogin"
                 @updateSessionId="handleUpdateSessionId"
             />
@@ -112,21 +112,21 @@
         <!-- 通话中：隐藏底部切换按钮 -->
         <div v-if="!isCalling" class="bottom-tabs">
             <div class="tab-group">
-                <el-tooltip :content="t('requiresSimplex')" placement="top" :disabled="cppMode !== 'duplex'">
+                <el-tooltip :content="t('menuTabVoice')" placement="top" :disabled="true">
                     <div
                         class="tab-btn"
-                        :class="{ active: activeTab === 'voice', 'disabled-tab': cppMode === 'duplex' }"
-                        @click="cppMode !== 'duplex' && handleClickTab('voice', 0)"
+                        :class="{ active: activeTab === 'voice' }"
+                        @click="handleClickTab('voice', 0)"
                     >
                         <SvgIcon name="mobile-voice-icon" class="tab-icon" />
                         <span class="tab-text">{{ language === 'zh' ? '语音通话' : 'Voice Call' }}</span>
                     </div>
                 </el-tooltip>
-                <el-tooltip :content="t('requiresDuplex')" placement="top" :disabled="cppMode !== 'simplex'">
+                <el-tooltip :content="t('menuTabVideo')" placement="top" :disabled="true">
                     <div
                         class="tab-btn"
-                        :class="{ active: activeTab === 'video', 'disabled-tab': cppMode === 'simplex' }"
-                        @click="cppMode !== 'simplex' && handleClickTab('video', 1)"
+                        :class="{ active: activeTab === 'video' }"
+                        @click="handleClickTab('video', 1)"
                     >
                         <SvgIcon name="mobile-video-icon" class="tab-icon" />
                         <span class="tab-text">{{ language === 'zh' ? '视频通话' : 'Video Call' }}</span>
@@ -407,7 +407,7 @@
 
     // 网络测速功能
     const { speedMbps, isTesting, startTesting, stopTesting } = useNetworkSpeed({
-        fileUrl: '/static/test.txt',
+        fileUrl: '/static/test.bin',
         fileSizeBytes: 500 * 1024, // 500 KB
         interval: 10000 // 每 10 秒检测一次
     });
@@ -434,7 +434,7 @@
 
     const loading = ref(false);
 
-    const modelType = ref(localStorage.getItem('modelType') || 'simplex'); // 单双工模式 'simplex' or 'duplex'
+    const modelType = ref(localStorage.getItem('modelType') || cppMode); // 单双工模式 'simplex' or 'duplex'
     const showMenu = ref(false);
     const showModelTypeDialog = ref(false);
     const selectedOption = ref('streaming');
@@ -627,11 +627,6 @@
         if (isCalling.value) return;
         if (modelType.value === val) return;
         modelType.value = val;
-
-        // 如果切换到双工模式，且当前是语音通话，自动切换到视频通话
-        if (val === 'duplex' && activeTab.value === 'voice') {
-            changeTab('video', 1);
-        }
 
         ElMessage.success(t('modeSwitchSuccess'));
         localStorage.setItem('modelType', val);

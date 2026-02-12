@@ -544,6 +544,10 @@ def start_health_server(port: int):
 
 def get_local_ip():
     """获取本机 IP 地址"""
+    forced_ip = os.environ.get("REGISTER_SERVICE_IP", "").strip()
+    if forced_ip:
+        return forced_ip
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         # 连接到一个不会真的通信的公网地址
