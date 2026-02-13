@@ -79,6 +79,62 @@
                 <div>音频轮次: {{ state.audioRounds.length }}</div>
             </div>
             <div class="debug-block">
+                <div class="debug-block-title">问题定位摘要</div>
+                <div v-if="roundDiagnostics.length === 0" class="debug-empty">暂无轮次诊断数据</div>
+                <div v-else class="debug-summary-row">
+                    <span>最近轮次 R{{ roundDiagnostics[0].roundId ?? 'N/A' }}</span>
+                    <span>说话尝试 {{ roundDiagnostics[0].localAttemptsBeforeGenerate }}</span>
+                    <span>vad_end {{ roundDiagnostics[0].vadEndsBeforeGenerate }}</span>
+                    <span>播音估计 {{ formatMsValue(roundDiagnostics[0].remoteSpeechTotalMs) }}</span>
+                    <span>play_end@{{ formatSecValue(roundDiagnostics[0].playEndMaxCurrentTimeSec) }}</span>
+                    <span>短回复嫌疑 {{ roundDiagnostics[0].shortReplySuspected ? 'yes' : 'no' }}</span>
+                </div>
+                <div v-if="roundDiagnostics.length > 0" class="debug-empty">
+                    {{ roundDiagnostics[0].hints.length ? roundDiagnostics[0].hints.join('；') : '暂无明显异常提示' }}
+                </div>
+            </div>
+            <div class="debug-block">
+                <div class="debug-block-title">轮次时序（最近{{ roundDiagnostics.length }}轮）</div>
+                <div v-if="roundDiagnostics.length === 0" class="debug-empty">暂无</div>
+                <div v-for="item in roundDiagnostics" :key="`diag-${item.roundId}-${item.generateStartAt || item.roundStartAt || 0}`" class="debug-round-row">
+                    <span class="round-id">R{{ item.roundId ?? 'N/A' }}</span>
+                    <span>尝试{{ item.localAttemptsBeforeGenerate }} / vad_end{{ item.vadEndsBeforeGenerate }}</span>
+                    <span>gen→audio {{ formatMsValue(item.msGenerateToAudioStart) }}</span>
+                    <span>gen→tts {{ formatMsValue(item.msGenerateToTtsFirstPcm) }}</span>
+                    <span>gen→end {{ formatMsValue(item.msGenerateToGenerateEnd) }}</span>
+                    <span>gen→1stPkt {{ formatMsValue(item.deltaGenToFirstPacket) }}</span>
+                    <span>gen→1stPlay {{ formatMsValue(item.deltaGenToFirstPlay) }}</span>
+                    <span>gen→actual {{ formatMsValue(item.deltaGenToActualPlay) }}</span>
+                    <span>远端说话 {{ formatMsValue(item.remoteSpeechTotalMs) }} / {{ item.remoteSpeechSegments }}段</span>
+                    <span>play_end@{{ formatSecValue(item.playEndMaxCurrentTimeSec) }}</span>
+                    <span>短回复嫌疑 {{ item.shortReplySuspected ? 'yes' : 'no' }}</span>
+                    <span class="hints">{{ item.hints.length ? item.hints.join('；') : '—' }}</span>
+                </div>
+            </div>
+            <div class="debug-block">
+                <div class="debug-block-title">本地说话片段（最近{{ recentLocalSpeechSegments.length }}段）</div>
+                <div v-if="recentLocalSpeechSegments.length === 0" class="debug-empty">暂无</div>
+                <div v-for="segment in recentLocalSpeechSegments" :key="segment.id" class="debug-local-segment-row">
+                    <span>{{ segment.time }}</span>
+                    <span>时长 {{ formatMsValue(segment.durationMs) }}</span>
+                    <span>状态 {{ segment.statusAtEnd || 'empty' }}</span>
+                    <span>轮次 {{ segment.roundIdAtEnd ?? 'N/A' }}</span>
+                    <span>间隔 {{ formatMsValue(segment.gapToOlderMs) }}</span>
+                </div>
+            </div>
+            <div class="debug-block">
+                <div class="debug-block-title">play_end探针（最近{{ recentPlayEndProbeEvents.length }}次）</div>
+                <div v-if="recentPlayEndProbeEvents.length === 0" class="debug-empty">暂无</div>
+                <div v-for="probe in recentPlayEndProbeEvents" :key="probe.id" class="debug-play-end-row">
+                    <span>{{ probe.time }}</span>
+                    <span>R{{ probe.roundId ?? 'N/A' }}</span>
+                    <span>audio.t={{ formatSecValue(probe.maxCurrentTimeSec) }}</span>
+                    <span>上游状态 {{ probe.lastInboundStateName || 'N/A' }}</span>
+                    <span>Δ{{ formatMsValue(probe.lastInboundStateDeltaMs) }}</span>
+                    <span>{{ probe.reason || 'N/A' }}</span>
+                </div>
+            </div>
+            <div class="debug-block">
                 <div class="debug-block-title">播放状态</div>
                 <div v-if="remoteAudioStatusList.length === 0" class="debug-empty">暂无远端音频元素</div>
                 <div v-for="audio in remoteAudioStatusList" :key="audio.sid" class="debug-audio-row">
@@ -237,6 +293,10 @@
 
     const DEBUG_EVENT_LIMIT = 60;
     const DEBUG_SIGNAL_LIMIT = 12;
+    const DEBUG_ROUND_LIMIT = 8;
+    const DEBUG_SEGMENT_LIMIT = 80;
+    const SHORT_REPLY_MAX_MS = 1300;
+    const SHORT_REPLY_MAX_CURRENT_TIME_SEC = 1.35;
 
     let debugTickTimer = null;
     let debugWaveRafId = 0;
@@ -248,6 +308,11 @@
     let remoteWaveAnalyser = null;
     let remoteWaveBuffer = null;
     let remoteWaveTrackId = '';
+    let localSpeakingSegment = null;
+    let remoteSpeakingSegment = null;
+    const localSpeechSegments = ref([]);
+    const remoteSpeechSegments = ref([]);
+    const playEndProbeEvents = ref([]);
 
     const pendingNoAudioMs = computed(() => {
         if (!state.pendingNoAudioDueAt) return 0;
@@ -277,6 +342,251 @@
                     ? item.payload.slice(0, 60) + '...'
                     : item.payload || ''
         }));
+    });
+
+    const remoteSpeakingActive = computed(() => Object.values(state.remoteAudioActive || {}).some(Boolean));
+
+    function appendLimited(listRef, value, limit = DEBUG_SEGMENT_LIMIT) {
+        listRef.value.unshift(value);
+        if (listRef.value.length > limit) {
+            listRef.value.splice(limit);
+        }
+    }
+
+    function formatMsValue(ms) {
+        return typeof ms === 'number' && Number.isFinite(ms) ? `${Math.round(ms)}ms` : 'N/A';
+    }
+
+    function formatSecValue(sec) {
+        return typeof sec === 'number' && Number.isFinite(sec) ? `${sec.toFixed(2)}s` : 'N/A';
+    }
+
+    function getLatestStateSignal(direction = 'in') {
+        const list = Array.isArray(state.messages) ? state.messages : [];
+        for (let i = list.length - 1; i >= 0; i--) {
+            const message = list[i];
+            if (message?.direction === direction && message?.stateName) {
+                return message;
+            }
+        }
+        return null;
+    }
+
+    const recentLocalSpeechSegments = computed(() => {
+        return localSpeechSegments.value.slice(0, 8).map((segment, index) => {
+            const olderSegment = localSpeechSegments.value[index + 1];
+            const gapToOlderMs =
+                olderSegment && typeof olderSegment.endAt === 'number' && typeof segment.startAt === 'number'
+                    ? Math.max(0, segment.startAt - olderSegment.endAt)
+                    : null;
+            return {
+                ...segment,
+                time: new Date(segment.startAt).toLocaleTimeString(),
+                gapToOlderMs
+            };
+        });
+    });
+
+    const recentPlayEndProbeEvents = computed(() => {
+        return playEndProbeEvents.value.slice(0, 6).map(item => ({
+            ...item,
+            time: new Date(item.timestamp).toLocaleTimeString()
+        }));
+    });
+
+    const roundDiagnostics = computed(() => {
+        const signalEvents = (Array.isArray(state.messages) ? state.messages : [])
+            .filter(item => item?.stateName && typeof item.timestamp === 'number')
+            .map(item => ({
+                direction: item.direction || 'in',
+                name: item.stateName,
+                roundId: Number.isInteger(item.stateRoundId) ? item.stateRoundId : null,
+                timestamp: item.timestamp
+            }));
+
+        const rounds = new Map();
+        const ensureRound = roundId => {
+            if (!rounds.has(roundId)) {
+                rounds.set(roundId, {
+                    roundId,
+                    roundStartAt: null,
+                    generateStartAt: null,
+                    audioStartAt: null,
+                    ttsFirstPcmAt: null,
+                    generateEndAt: null,
+                    generateNoAudioAt: null,
+                    playEndOutAt: null,
+                    playEndAckAt: null,
+                    playEndProbeAt: null,
+                    playEndProbe: null,
+                    deltaGenToFirstPacket: null,
+                    deltaGenToFirstPlay: null,
+                    deltaGenToActualPlay: null,
+                    localAttemptsBeforeGenerate: 0,
+                    vadEndsBeforeGenerate: 0,
+                    msGenerateToAudioStart: null,
+                    msGenerateToTtsFirstPcm: null,
+                    msGenerateToGenerateEnd: null,
+                    remoteSpeechTotalMs: 0,
+                    remoteSpeechSegments: 0,
+                    playEndMaxCurrentTimeSec: null,
+                    shortReplySuspected: false,
+                    hints: []
+                });
+            }
+            return rounds.get(roundId);
+        };
+
+        signalEvents.forEach(event => {
+            if (!Number.isInteger(event.roundId)) return;
+            const row = ensureRound(event.roundId);
+            if (event.direction === 'in') {
+                if (event.name === 'round_start' && !row.roundStartAt) row.roundStartAt = event.timestamp;
+                if (event.name === 'generate_start' && !row.generateStartAt) row.generateStartAt = event.timestamp;
+                if (event.name === 'audio_start' && !row.audioStartAt) row.audioStartAt = event.timestamp;
+                if (event.name === 'tts_first_pcm' && !row.ttsFirstPcmAt) row.ttsFirstPcmAt = event.timestamp;
+                if (event.name === 'generate_end') row.generateEndAt = event.timestamp;
+                if (event.name === 'generate_no_audio') row.generateNoAudioAt = event.timestamp;
+                if (event.name === 'play_end_success') row.playEndAckAt = event.timestamp;
+            } else if (event.direction === 'out' && event.name === 'play_end') {
+                row.playEndOutAt = event.timestamp;
+            }
+        });
+
+        (Array.isArray(state.audioRounds) ? state.audioRounds : []).forEach(round => {
+            if (!Number.isInteger(round?.roundId)) return;
+            const row = ensureRound(round.roundId);
+            if (typeof round.deltas?.fromGenerateStart === 'number') {
+                row.deltaGenToFirstPacket = round.deltas.fromGenerateStart;
+            }
+            if (typeof round.deltas?.fromGenerateStartToPlay === 'number') {
+                row.deltaGenToFirstPlay = round.deltas.fromGenerateStartToPlay;
+            }
+            if (typeof round.deltas?.fromGenerateStartToActualPlay === 'number') {
+                row.deltaGenToActualPlay = round.deltas.fromGenerateStartToActualPlay;
+            }
+        });
+
+        playEndProbeEvents.value.forEach(probe => {
+            if (!Number.isInteger(probe?.roundId)) return;
+            const row = ensureRound(probe.roundId);
+            if (!row.playEndProbeAt || probe.timestamp >= row.playEndProbeAt) {
+                row.playEndProbeAt = probe.timestamp;
+                row.playEndProbe = probe;
+            }
+        });
+
+        const rows = Array.from(rounds.values());
+        const vadEndSignals = signalEvents
+            .filter(event => event.direction === 'in' && event.name === 'vad_end')
+            .map(event => event.timestamp)
+            .sort((a, b) => a - b);
+
+        const roundStartTimeline = rows
+            .map(row => ({
+                roundId: row.roundId,
+                startAt: row.generateStartAt || row.roundStartAt || null
+            }))
+            .filter(item => typeof item.startAt === 'number')
+            .sort((a, b) => a.startAt - b.startAt);
+
+        rows.forEach(row => {
+            const anchorStart = row.generateStartAt || row.roundStartAt || null;
+            let previousRoundStart = 0;
+            if (typeof anchorStart === 'number') {
+                for (const item of roundStartTimeline) {
+                    if (item.startAt < anchorStart) {
+                        previousRoundStart = item.startAt;
+                        continue;
+                    }
+                    break;
+                }
+                row.localAttemptsBeforeGenerate = localSpeechSegments.value.filter(
+                    segment =>
+                        typeof segment.endAt === 'number' &&
+                        segment.endAt > previousRoundStart &&
+                        segment.endAt <= anchorStart
+                ).length;
+                row.vadEndsBeforeGenerate = vadEndSignals.filter(
+                    timestamp => timestamp > previousRoundStart && timestamp <= anchorStart
+                ).length;
+            }
+
+            row.msGenerateToAudioStart =
+                typeof row.generateStartAt === 'number' && typeof row.audioStartAt === 'number'
+                    ? row.audioStartAt - row.generateStartAt
+                    : null;
+            row.msGenerateToTtsFirstPcm =
+                typeof row.generateStartAt === 'number' && typeof row.ttsFirstPcmAt === 'number'
+                    ? row.ttsFirstPcmAt - row.generateStartAt
+                    : null;
+            row.msGenerateToGenerateEnd =
+                typeof row.generateStartAt === 'number' && typeof row.generateEndAt === 'number'
+                    ? row.generateEndAt - row.generateStartAt
+                    : null;
+
+            let rangeStart = row.generateStartAt || row.roundStartAt || null;
+            if (typeof rangeStart !== 'number') {
+                rangeStart = row.audioStartAt || row.generateEndAt || null;
+            }
+            const rangeEndCandidates = [row.playEndAckAt, row.playEndOutAt, row.playEndProbeAt].filter(
+                value => typeof value === 'number'
+            );
+            let rangeEnd =
+                rangeEndCandidates.length > 0
+                    ? Math.max(...rangeEndCandidates)
+                    : typeof row.generateEndAt === 'number'
+                      ? row.generateEndAt + 4000
+                      : null;
+
+            let remoteSpeechTotalMs = 0;
+            let remoteSpeechSegmentsCount = 0;
+            if (typeof rangeStart === 'number' && typeof rangeEnd === 'number' && rangeEnd >= rangeStart) {
+                remoteSpeechSegments.value.forEach(segment => {
+                    const segmentStart = segment.startAt;
+                    const segmentEnd = segment.endAt || Date.now();
+                    if (typeof segmentStart !== 'number' || typeof segmentEnd !== 'number') return;
+                    const overlapMs = Math.max(0, Math.min(rangeEnd, segmentEnd) - Math.max(rangeStart, segmentStart));
+                    if (overlapMs > 0) {
+                        remoteSpeechTotalMs += overlapMs;
+                        remoteSpeechSegmentsCount += 1;
+                    }
+                });
+            }
+            row.remoteSpeechTotalMs = Math.round(remoteSpeechTotalMs);
+            row.remoteSpeechSegments = remoteSpeechSegmentsCount;
+            row.playEndMaxCurrentTimeSec =
+                typeof row.playEndProbe?.maxCurrentTimeSec === 'number' ? row.playEndProbe.maxCurrentTimeSec : null;
+            row.shortReplySuspected =
+                (typeof row.playEndMaxCurrentTimeSec === 'number' &&
+                    row.playEndMaxCurrentTimeSec > 0 &&
+                    row.playEndMaxCurrentTimeSec <= SHORT_REPLY_MAX_CURRENT_TIME_SEC) ||
+                (row.remoteSpeechTotalMs > 0 && row.remoteSpeechTotalMs <= SHORT_REPLY_MAX_MS);
+
+            const hints = [];
+            if (row.localAttemptsBeforeGenerate >= 2) {
+                hints.push(`本地说话 ${row.localAttemptsBeforeGenerate} 次后才触发生成`);
+            }
+            if (row.localAttemptsBeforeGenerate > 0 && row.vadEndsBeforeGenerate === 0) {
+                hints.push('本地说话后未观测到 vad_end');
+            }
+            if (row.generateNoAudioAt) {
+                hints.push('收到 generate_no_audio');
+            }
+            if (row.shortReplySuspected) {
+                hints.push('疑似短回复或提前 play_end');
+            }
+            row.hints = hints;
+        });
+
+        return rows
+            .sort((left, right) => {
+                const leftAnchor = left.generateStartAt || left.roundStartAt || 0;
+                const rightAnchor = right.generateStartAt || right.roundStartAt || 0;
+                if (leftAnchor !== rightAnchor) return rightAnchor - leftAnchor;
+                return (right.roundId || 0) - (left.roundId || 0);
+            })
+            .slice(0, DEBUG_ROUND_LIMIT);
     });
 
     function safeStringify(value) {
@@ -536,6 +846,12 @@
                 audioRounds: state.audioRounds.length
             },
             audioElements: remoteAudioStatusList.value,
+            diagnostics: {
+                roundDiagnostics: roundDiagnostics.value,
+                recentLocalSpeechSegments: recentLocalSpeechSegments.value,
+                recentPlayEndProbeEvents: recentPlayEndProbeEvents.value,
+                playEndHistory: state.debugPlayEndHistory || []
+            },
             recentSignals: latestSignalMessages.value,
             recentEvents: debugEvents.value.slice(0, 20)
         };
@@ -567,6 +883,11 @@
 
     function clearDebugEvents() {
         debugEvents.value = [];
+        localSpeechSegments.value = [];
+        remoteSpeechSegments.value = [];
+        playEndProbeEvents.value = [];
+        localSpeakingSegment = null;
+        remoteSpeakingSegment = null;
     }
 
     function startDebugRuntime() {
@@ -759,6 +1080,31 @@
         () => state.connected,
         connected => {
             pushDebugEvent('connection', connected ? 'connected' : 'disconnected');
+            if (!connected) {
+                const now = Date.now();
+                if (localSpeakingSegment) {
+                    appendLimited(localSpeechSegments, {
+                        ...localSpeakingSegment,
+                        endAt: now,
+                        durationMs: Math.max(0, now - localSpeakingSegment.startAt),
+                        statusAtEnd: state.status || 'empty',
+                        roundIdAtEnd: state.currentGenerateRoundId ?? null,
+                        forcedEnd: true
+                    });
+                    localSpeakingSegment = null;
+                }
+                if (remoteSpeakingSegment) {
+                    appendLimited(remoteSpeechSegments, {
+                        ...remoteSpeakingSegment,
+                        endAt: now,
+                        durationMs: Math.max(0, now - remoteSpeakingSegment.startAt),
+                        statusAtEnd: state.status || 'empty',
+                        roundIdAtEnd: state.currentGenerateRoundId ?? null,
+                        forcedEnd: true
+                    });
+                    remoteSpeakingSegment = null;
+                }
+            }
         },
         { immediate: true }
     );
@@ -766,6 +1112,26 @@
     watch(
         () => state.localAudioActive,
         active => {
+            const now = Date.now();
+            if (active) {
+                if (!localSpeakingSegment) {
+                    localSpeakingSegment = {
+                        id: `local-${now}-${Math.random().toString(36).slice(2, 7)}`,
+                        startAt: now,
+                        statusAtStart: state.status || 'empty',
+                        roundIdAtStart: state.currentGenerateRoundId ?? null
+                    };
+                }
+            } else if (localSpeakingSegment) {
+                appendLimited(localSpeechSegments, {
+                    ...localSpeakingSegment,
+                    endAt: now,
+                    durationMs: Math.max(0, now - localSpeakingSegment.startAt),
+                    statusAtEnd: state.status || 'empty',
+                    roundIdAtEnd: state.currentGenerateRoundId ?? null
+                });
+                localSpeakingSegment = null;
+            }
             pushDebugEvent('local-audio', active ? 'active' : 'idle');
         }
     );
@@ -774,6 +1140,32 @@
         () => JSON.stringify(state.remoteAudioActive || {}),
         payload => {
             pushDebugEvent('remote-audio', payload);
+        }
+    );
+
+    watch(
+        remoteSpeakingActive,
+        active => {
+            const now = Date.now();
+            if (active) {
+                if (!remoteSpeakingSegment) {
+                    remoteSpeakingSegment = {
+                        id: `remote-${now}-${Math.random().toString(36).slice(2, 7)}`,
+                        startAt: now,
+                        statusAtStart: state.status || 'empty',
+                        roundIdAtStart: state.currentGenerateRoundId ?? null
+                    };
+                }
+            } else if (remoteSpeakingSegment) {
+                appendLimited(remoteSpeechSegments, {
+                    ...remoteSpeakingSegment,
+                    endAt: now,
+                    durationMs: Math.max(0, now - remoteSpeakingSegment.startAt),
+                    statusAtEnd: state.status || 'empty',
+                    roundIdAtEnd: state.currentGenerateRoundId ?? null
+                });
+                remoteSpeakingSegment = null;
+            }
         }
     );
 
@@ -789,6 +1181,39 @@
     watch(
         () => state.playEndSent,
         flag => {
+            if (flag) {
+                const now = Date.now();
+                const audioElements = Object.keys(remoteAudioRefs).map(sid => {
+                    const element = remoteAudioRefs[sid];
+                    return {
+                        sid,
+                        currentTimeSec:
+                            element && Number.isFinite(element.currentTime) ? Number(element.currentTime.toFixed(3)) : 0
+                    };
+                });
+                const maxCurrentTimeSec =
+                    audioElements.length > 0
+                        ? Math.max(...audioElements.map(item => item.currentTimeSec || 0))
+                        : 0;
+                const lastInboundState = getLatestStateSignal('in');
+                appendLimited(
+                    playEndProbeEvents,
+                    {
+                        id: `play-end-${now}-${Math.random().toString(36).slice(2, 7)}`,
+                        timestamp: now,
+                        roundId: state.playEndRoundId ?? state.currentGenerateRoundId ?? null,
+                        reason: state.debugLastPlayEnd?.reason || '',
+                        maxCurrentTimeSec,
+                        audioElements,
+                        lastInboundStateName: lastInboundState?.stateName || '',
+                        lastInboundStateDeltaMs:
+                            lastInboundState && typeof lastInboundState.timestamp === 'number'
+                                ? Math.max(0, now - lastInboundState.timestamp)
+                                : null
+                    },
+                    20
+                );
+            }
             pushDebugEvent('play_end', flag ? 'sent' : 'reset');
         }
     );
@@ -1505,6 +1930,29 @@
 
     .debug-event-row {
         grid-template-columns: 0.9fr 0.9fr 2.2fr;
+    }
+
+    .debug-summary-row,
+    .debug-round-row,
+    .debug-local-segment-row,
+    .debug-play-end-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 10px;
+        align-items: center;
+        font-size: 11px;
+        line-height: 1.35;
+        border-top: 1px dashed rgba(148, 163, 184, 0.24);
+        padding-top: 4px;
+    }
+
+    .debug-round-row .round-id {
+        color: #fbbf24;
+    }
+
+    .debug-round-row .hints {
+        width: 100%;
+        color: #fda4af;
     }
 
     .debug-signal-row .dir {

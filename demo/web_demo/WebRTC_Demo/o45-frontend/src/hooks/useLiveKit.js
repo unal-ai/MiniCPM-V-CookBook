@@ -339,7 +339,9 @@ const state = reactive({
     pendingNoAudioRoundId: null, // no-audio 保护中的轮次
     pendingNoAudioDueAt: 0, // no-audio 保护预计触发时间
     generateEndTimestamp: 0, // 🔧 记录 generate_end 的接收时间（用于静默检查保护）
-    lastPlayEndAckTimestamp: 0 // 记录收到 play_end_success 的时间，用于抑制紧随其后的误触发 generate_start
+    lastPlayEndAckTimestamp: 0, // 记录收到 play_end_success 的时间，用于抑制紧随其后的误触发 generate_start
+    debugLastPlayEnd: null, // 最近一次 play_end 发送诊断信息
+    debugPlayEndHistory: [] // play_end 发送历史（诊断用）
 });
 
 let timer = null;
@@ -392,6 +394,7 @@ const RECENT_STATE_EVENT_WINDOW_MS = 200;
 const GENERATE_START_COOLDOWN_AFTER_PLAY_END_ACK_MS = 900;
 const NO_AUDIO_GRACE_MS = 1800;
 const MAX_SIGNAL_TRACE_MESSAGES = 200;
+const MAX_DEBUG_PLAY_END_HISTORY = 30;
 
 function parseStateEvent(message = '') {
     if (typeof message !== 'string') return null;
@@ -1905,6 +1908,21 @@ export function useLiveKit() {
         state.playEndSent = true;
         state.playEndTimestamp = performance.now();
         state.playEndRoundId = effectiveRoundId;
+        const debugPlayEndEntry = {
+            timestamp: Date.now(),
+            reason,
+            roundId: effectiveRoundId,
+            bypassGuard,
+            status: state.status || '',
+            mode: state.mode,
+            generateEnd: state.generateEnd,
+            currentRoundHasAudio: state.currentRoundHasAudio
+        };
+        state.debugLastPlayEnd = debugPlayEndEntry;
+        state.debugPlayEndHistory.push(debugPlayEndEntry);
+        if (state.debugPlayEndHistory.length > MAX_DEBUG_PLAY_END_HISTORY) {
+            state.debugPlayEndHistory.splice(0, state.debugPlayEndHistory.length - MAX_DEBUG_PLAY_END_HISTORY);
+        }
         clearPendingNoAudioTimer('发送 play_end');
 
         // 使用醒目的样式打印日志
@@ -2554,6 +2572,8 @@ export function useLiveKit() {
         state.playEndRoundId = null;
         state.currentRoundHasAudio = false; // 重置音频标记
         state.currentGenerateRoundId = null;
+        state.debugLastPlayEnd = null;
+        state.debugPlayEndHistory = [];
         state.mode = mode; // 保存当前通话模式
 
         silenceTimers.forEach(clearTimeout);
@@ -4667,6 +4687,8 @@ export function useLiveKit() {
             state.playEndRoundId = null;
             state.currentRoundHasAudio = false;
             state.currentGenerateRoundId = null;
+            state.debugLastPlayEnd = null;
+            state.debugPlayEndHistory = [];
             clearPendingNoAudioTimer('joinRoom 失败清理');
         }
     }
@@ -5382,6 +5404,8 @@ export function useLiveKit() {
         state.remoteAudioActive = {};
         state.messages = [];
         state.room = null;
+        state.debugLastPlayEnd = null;
+        state.debugPlayEndHistory = [];
         // 清理组件层 <audio> 元素
         if (onCleanup) onCleanup(Object.keys(state.remoteAudioActive));
         state.status = '';
