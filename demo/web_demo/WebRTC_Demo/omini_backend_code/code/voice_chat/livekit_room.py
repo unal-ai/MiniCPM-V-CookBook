@@ -58,6 +58,7 @@ class LiveKitRoom:
         self.shared_state = shared_state
         self.image_frame_count = 0
         self.highRefresh = request.highRefresh
+        self._image_prefill_task = None
         
         # 前端用户连接事件，用于等待用户进入房间后再发送关键消息
         self.participant_connected_event = asyncio.Event()
@@ -258,6 +259,12 @@ class LiveKitRoom:
             # 如果是单工并且正在输出，则直接返回
             if self.model_cpm.model_type == ModelType.SIMPLEX and not self.model_cpm.play_end_event.is_set():
                 continue
+            # 生成期间跳过图片 prefill，避免与 generate 并发导致空轮次
+            if self.model_cpm.model_generating_flag.is_set():
+                continue
+            # 上一张图片 prefill 还在执行时，直接丢弃当前帧，避免任务堆积
+            if self._image_prefill_task is not None and not self._image_prefill_task.done():
+                continue
             await self.shared_state.increment_image_number()
             # 保存图片到队列
             try:
@@ -268,8 +275,10 @@ class LiveKitRoom:
                 arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
                 # 转换为PIL Image格式
                 pil_image = Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
-
-                asyncio.create_task(self.model_cpm.model_prefill(session_id=self.session_id, image_data=pil_image))                
+                self._image_prefill_task = asyncio.create_task(
+                    self.model_cpm.model_prefill(session_id=self.session_id, image_data=pil_image)
+                )
+                self._image_prefill_task.add_done_callback(self._on_image_prefill_done)
                 # 计算距上次处理的间隔时间
                 interval = current_time - self.last_image_process_time
                 # 更新上次处理时间
@@ -281,6 +290,16 @@ class LiveKitRoom:
             self.image_frame_count += 1
             if self.image_frame_count % 100 == 0:
                 logger.info(f"第 {await self.shared_state.get_round()} 轮对话, 已处理 {self.image_frame_count} 帧")
+
+    def _on_image_prefill_done(self, task: asyncio.Task):
+        if self._image_prefill_task is task:
+            self._image_prefill_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.info("图片 prefill 任务已取消")
+        except Exception as e:
+            logger.error(f"图片 prefill 任务异常: {e}")
     
     async def _handle_data_message(self, text_message: str, participant):
         """处理通过 publish_data 接收到的消息"""

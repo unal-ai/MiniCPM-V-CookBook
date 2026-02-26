@@ -25,7 +25,13 @@ class MiniCpmModel ():
      self.request = request
      self.model_type = ModelType.get_model_name(model_type=request.modelType)
      self.api_base_url = f"http://{inference_service.ip}:{inference_service.model_port}"
-     self.break_url = f"http://{inference_service.ip}:{inference_service.model_port+1}"
+     # 历史上打断接口走 model_port+1，部分环境该端口不可达时回退到 model_port 本体接口。
+     self.break_base_urls = [
+         f"http://{inference_service.ip}:{inference_service.model_port+1}",
+         self.api_base_url,
+     ]
+     # 去重并保持顺序
+     self.break_base_urls = list(dict.fromkeys(self.break_base_urls))
      # 使用全局单例 HTTP 客户端，共享连接池
      self.http_util = get_async_http_util(max_retries=3)
      # 模型是否正在输出
@@ -39,6 +45,8 @@ class MiniCpmModel ():
      self.shared_state = shared_state
      self.model_generating_flag = model_generating_flag
      self.active_round_id = None
+     # 保护同一会话内的 generate 与图片 prefill，不让两者并发打乱 C++ 双工状态
+     self._generate_prefill_lock = asyncio.Lock()
 
    async def model_init(self):
         try:
@@ -80,10 +88,15 @@ class MiniCpmModel ():
         image_data: Optional[Union[np.ndarray, bytes]] = None, last_chunk: bool = False) -> Dict[str, Any]:
         roundId = await self.shared_state.get_round()
         image_audio_id = await self.shared_state.get_current_image_audio_id()
+        image_only_prefill = image_data is not None and (audio_data is None or len(audio_data) == 0)
         # 模型如果是单工并且正在输出，则直接返回
         if self.model_type == ModelType.SIMPLEX and not self.play_end_event.is_set():
             logger.info(f"模型和前端正在输出,忽略prefill")
-            return {"success": True, "data": {"message": "prefill success"}}        
+            return {"success": True, "data": {"message": "prefill success"}}
+        # 生成期间丢弃纯图片 prefill，避免与 streaming_generate 并发导致空轮次
+        if image_only_prefill and self.model_generating_flag.is_set():
+            logger.info("模型正在生成，跳过图片 prefill")
+            return {"success": True, "data": {"message": "skip image prefill while generating"}}
         # 编码为 base64
         audio_content = None
         if audio_data is not None and len(audio_data) > 0:
@@ -91,6 +104,10 @@ class MiniCpmModel ():
         image_content = None
         if image_data is not None:
             image_content = self._encode_image_to_base64(image_data, image_format="jpeg")
+        if image_only_prefill:
+            async with self._generate_prefill_lock:
+                return await self.streaming_prefill(session_id=session_id, audio_data=audio_content, image_data=image_content, 
+                roundId=roundId, image_audio_id=image_audio_id, last_chunk=last_chunk)
         return await self.streaming_prefill(session_id=session_id, audio_data=audio_content, image_data=image_content, 
         roundId=roundId, image_audio_id=image_audio_id, last_chunk=last_chunk)
 
@@ -143,6 +160,8 @@ class MiniCpmModel ():
    async def streaming_generate(
          self,
          session_id: str,
+         emit_round_state: bool = True,
+         reuse_round_id: Optional[int] = None,
         ) -> Generator[Dict[str, Any], None, None]:
       """
       Omni流式生成接口
@@ -166,39 +185,51 @@ class MiniCpmModel ():
           if self.model_type not in [ModelType.SIMPLEX, ModelType.DUPLEX]:
               raise ValueError(f"不支持的模式: {self.model_type}，支持的模式: {ModelType.SIMPLEX}, {ModelType.DUPLEX}")
           self.model_generating_flag.set()
-          # 构建请求数据
-          request_data = {
-              "session_id": session_id,
-              "mode": self.model_type.value,
-              "stream": True
-          }
-          
-          # 构建API URL
-          api_url = f"{self.api_base_url}/omni/streaming_generate"
-          
-          logger.info(f"发送Omni generate请求到: {api_url}, 请求参数: {request_data}")
-          
-          self.play_end_event.clear()
-          current_round_id = await self.shared_state.increment_round()
-          self.active_round_id = current_round_id
-          await self.text_output_queue.put(f"<state><round_start:{current_round_id}>")
-          await self.text_output_queue.put(f"<state><generate_start:{current_round_id}>")
-          send_first_chunk = False
-          # 流式请求
-          async for chunk in self.http_util.stream_post(
-              url=api_url,
-              json_data=request_data,
-              headers={'Content-Type': 'application/json'}
-          ):
-            # 解析流式数据
-            if not send_first_chunk:
-                self.first_tts.set()
-                await self.text_output_queue.put(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - <state><generate_first_chunk>")
-                await self.text_output_queue.put(f"<state><generate_first_chunk:{current_round_id}>")
-                send_first_chunk = True
-            parsed_data = self._parse_stream_chunk(chunk)
-            if parsed_data:
-                yield parsed_data
+          async with self._generate_prefill_lock:
+              # 构建请求数据
+              request_data = {
+                  "session_id": session_id,
+                  "mode": self.model_type.value,
+                  "stream": True
+              }
+              
+              # 构建API URL
+              api_url = f"{self.api_base_url}/omni/streaming_generate"
+              
+              logger.info(f"发送Omni generate请求到: {api_url}, 请求参数: {request_data}")
+              
+              self.play_end_event.clear()
+              if emit_round_state:
+                  current_round_id = await self.shared_state.increment_round()
+                  self.active_round_id = current_round_id
+                  await self.text_output_queue.put(f"<state><round_start:{current_round_id}>")
+                  await self.text_output_queue.put(f"<state><generate_start:{current_round_id}>")
+              else:
+                  if reuse_round_id is not None:
+                      current_round_id = reuse_round_id
+                  elif self.active_round_id is not None:
+                      current_round_id = self.active_round_id
+                  else:
+                      current_round_id = await self.shared_state.get_round()
+                  self.active_round_id = current_round_id
+                  logger.info(f"复用轮次进行 generate 重试: round={current_round_id}")
+              send_first_chunk = False
+              # 流式请求
+              async for chunk in self.http_util.stream_post(
+                  url=api_url,
+                  json_data=request_data,
+                  headers={'Content-Type': 'application/json'}
+              ):
+                parsed_data = self._parse_stream_chunk(chunk)
+                if parsed_data:
+                    # 仅在收到首个“有效生成块”时发送 generate_first_chunk。
+                    # done/结束块不应触发该状态，否则前端会误判“有内容正在生成”。
+                    if not send_first_chunk and not self._is_done_chunk(parsed_data):
+                        self.first_tts.set()
+                        await self.text_output_queue.put(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} - <state><generate_first_chunk>")
+                        await self.text_output_queue.put(f"<state><generate_first_chunk:{current_round_id}>")
+                        send_first_chunk = True
+                    yield parsed_data
       except Exception as e:
           error_msg = str(e) if str(e) else repr(e)
           logger.error(f"Omni generate请求异常: {type(e).__name__}: {error_msg}")
@@ -207,16 +238,33 @@ class MiniCpmModel ():
           logger.info("streaming_generate 模型输出完成")
           self.model_generating_flag.clear()
 
+   async def _post_break_control(self, path: str) -> Dict[str, Any]:
+        """发送 break/stop 控制请求，优先 model_port+1，失败后回退到 model_port。"""
+        last_error: Optional[Exception] = None
+        for base_url in self.break_base_urls:
+            target_url = f"{base_url}{path}"
+            try:
+                response = await self.http_util.post(
+                    url=target_url,
+                    headers={'Content-Type': 'application/json'}
+                )
+                if response.get('success'):
+                    return response
+                logger.warning(f"控制请求返回失败，尝试下一个地址: {target_url}, response={response}")
+            except Exception as e:
+                last_error = e
+                logger.warning(f"控制请求失败，尝试下一个地址: {target_url}, error={e}")
+        if last_error:
+            raise HTTPUtilError(f"控制请求失败(path={path}): {last_error}")
+        raise HTTPUtilError(f"控制请求失败(path={path}): 所有地址均返回失败")
+
    async def streaming_break(self, session_id: str, text: str = ""):
         try:
             data = None
             if not self.model_generating_flag.is_set():
                 logger.info(f"模型和前端已经输出结束,忽略break")                
             else:
-                response = await self.http_util.post(
-                    url=f"{self.break_url}/omni/break",
-                    headers={'Content-Type': 'application/json'}
-                    )
+                response = await self._post_break_control("/omni/break")
                 # 回到模型聆听中
                 logger.info(f"模型打断成功, 回到模型聆听中, response={response}")
                 data = response['data']
@@ -236,10 +284,7 @@ class MiniCpmModel ():
 
    async def streaming_stop(self, session_id: str):
         try:
-            response = await self.http_util.post(
-                url=f"{self.break_url}/omni/stop",
-                headers={'Content-Type': 'application/json'}
-            )
+            response = await self._post_break_control("/omni/stop")
             logger.info(f"Omni stop请求返回结果: {response}")
             # 重置模型为可用
             if (response['success']):
@@ -425,3 +470,12 @@ class MiniCpmModel ():
        except Exception as e:
            logger.error(f"解析流式数据异常: {str(e)}")
            return None
+
+   @staticmethod
+   def _is_done_chunk(parsed_data: Dict[str, Any]) -> bool:
+       """统一判断流式结束块，避免把 done 误当成首包内容。"""
+       if not isinstance(parsed_data, dict):
+           return False
+       if parsed_data.get("type") == "done":
+           return True
+       return parsed_data.get("done") is True

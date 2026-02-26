@@ -345,18 +345,56 @@ fi
 # ========== 启动 Docker 服务 ==========
 echo -e "${YELLOW}[4/8] 启动 Docker 服务...${NC}"
 
+wait_compose_services_ready() {
+    local retries=30
+    local delay=2
+    local expected_services=()
+    local service=""
+
+    while IFS= read -r service; do
+        [ -n "$service" ] && expected_services+=("$service")
+    done < <(docker compose config --services 2>/dev/null || true)
+
+    if [ "${#expected_services[@]}" -eq 0 ]; then
+        echo -e "${RED}❌ 无法获取 compose 服务列表${NC}"
+        return 1
+    fi
+
+    local attempt running_services all_running missing_services
+    for ((attempt=1; attempt<=retries; attempt++)); do
+        running_services="$(docker compose ps --services --status running 2>/dev/null || true)"
+        all_running=true
+        missing_services=()
+
+        for service in "${expected_services[@]}"; do
+            if ! echo "$running_services" | grep -Fxq "$service"; then
+                all_running=false
+                missing_services+=("$service")
+            fi
+        done
+
+        if [ "$all_running" = true ]; then
+            return 0
+        fi
+
+        echo "   等待服务就绪 (${attempt}/${retries})，未就绪: ${missing_services[*]}"
+        sleep "$delay"
+    done
+
+    return 1
+}
+
 # 停止旧服务（含匿名卷，避免残留状态）
 docker compose down --remove-orphans --volumes 2>/dev/null || true
 
 # 启动新服务
-docker compose up -d
+docker compose up --build -d
 
 # 等待服务启动
 echo "   等待服务启动..."
-sleep 10
 
 # 检查服务状态
-if docker compose ps | grep -q "Up"; then
+if wait_compose_services_ready; then
     echo -e "${GREEN}✅ Docker 服务已启动${NC}"
     docker compose ps
 else
@@ -387,6 +425,7 @@ build_and_sync_frontend() {
 
     echo "   构建前端静态资源..."
     pushd "$FRONTEND_DIR" >/dev/null
+    rm -rf dist
 
     if [ ! -d node_modules ]; then
         echo "   安装前端依赖..."

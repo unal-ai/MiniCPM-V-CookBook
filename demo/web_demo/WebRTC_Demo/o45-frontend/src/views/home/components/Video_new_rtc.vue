@@ -108,6 +108,13 @@
         </div>
     </div>
     <DraggableDialog v-if="showText" :message="state.chatMessages" @close="showText = false" />
+    <LiveKitDebugPanel
+        :state="state"
+        :is-calling="isCalling"
+        :call-loading="callLoading"
+        :remote-audio-refs="remoteAudioRefs"
+        context="video-pc"
+    />
 </template>
 <script setup>
     import { Loading } from '@element-plus/icons-vue';
@@ -128,6 +135,7 @@
     // import AutoPlayAudioStream from '@/hooks/usePlay';
     import AutoPlayAudioStream from '@/views/test/bestPlayVoice';
     import VoiceGifCopy from '@/components/VoiceGifCopy/index.vue';
+    import LiveKitDebugPanel from '@/components/LiveKitDebugPanel.vue';
 
     // import AudioPlayer from './audioPlayer/useAudioStream';
     // const audioStream = AudioPlayer();

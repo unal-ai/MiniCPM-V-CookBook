@@ -393,6 +393,8 @@ const recentStateEventAt = new Map();
 const RECENT_STATE_EVENT_WINDOW_MS = 200;
 const GENERATE_START_COOLDOWN_AFTER_PLAY_END_ACK_MS = 900;
 const NO_AUDIO_GRACE_MS = 1800;
+const NO_AUDIO_WAIT_SLOW_SERVER_MS = 3200;
+const NO_AUDIO_WAIT_EXPLICIT_EMPTY_MS = 450;
 const MAX_SIGNAL_TRACE_MESSAGES = 200;
 const MAX_DEBUG_PLAY_END_HISTORY = 30;
 
@@ -866,7 +868,18 @@ function cleanupOnSessionEnd() {
         clearTimeout(pendingPlayEndTimer);
         pendingPlayEndTimer = null;
     }
-    clearPendingNoAudioTimer('会话结束清理');
+    if (pendingNoAudioTimer) {
+        clearTimeout(pendingNoAudioTimer);
+        pendingNoAudioTimer = null;
+    }
+    if (state.pendingNoAudioRoundId !== null) {
+        console.log(`🧹 [${formatSyncedTimestamp()}] 清理 no-audio 定时器`, {
+            reason: '会话结束清理',
+            roundId: state.pendingNoAudioRoundId
+        });
+    }
+    state.pendingNoAudioRoundId = null;
+    state.pendingNoAudioDueAt = 0;
 
     // 清理所有累积数据
     state.audioRounds = [];
@@ -1809,18 +1822,23 @@ export function useLiveKit() {
         state.pendingNoAudioDueAt = 0;
     }
 
-    function scheduleNoAudioPlayEnd(roundId = null, reason = 'generate_end 后未检测到音频') {
+    function scheduleNoAudioPlayEnd(roundId = null, reason = 'generate_end 后未检测到音频', options = {}) {
         const targetRoundId = resolveRoundId(roundId);
+        const requestedGraceMs = Number(options.graceMs);
+        const graceMs =
+            Number.isFinite(requestedGraceMs) && requestedGraceMs >= 0 ? requestedGraceMs : NO_AUDIO_GRACE_MS;
+        const policy = options.policy || 'default';
         clearPendingNoAudioTimer('重建 no-audio 定时器');
         state.pendingNoAudioRoundId = targetRoundId;
-        state.pendingNoAudioDueAt = performance.now() + NO_AUDIO_GRACE_MS;
+        state.pendingNoAudioDueAt = performance.now() + graceMs;
 
         console.warn(
-            `%c⏳ [${formatSyncedTimestamp()}] 启动 no-audio 保护窗口 ${NO_AUDIO_GRACE_MS}ms`,
+            `%c⏳ [${formatSyncedTimestamp()}] 启动 no-audio 保护窗口 ${graceMs}ms`,
             'color: #ff9800; font-weight: bold; font-size: 13px',
             {
                 roundId: targetRoundId,
-                reason
+                reason,
+                policy
             }
         );
 
@@ -1855,8 +1873,8 @@ export function useLiveKit() {
                 return;
             }
             state.status = 'listening';
-            sendPlayEnd(`no-audio 超时 ${NO_AUDIO_GRACE_MS}ms`, false, targetRoundId);
-        }, NO_AUDIO_GRACE_MS);
+            sendPlayEnd(`no-audio 超时 ${graceMs}ms`, false, targetRoundId);
+        }, graceMs);
     }
 
     /**
@@ -1957,8 +1975,12 @@ export function useLiveKit() {
             // 🔥 关键优化：检查是否是 play_end 后的延迟音频包
             const timeSincePlayEnd = performance.now() - state.playEndTimestamp;
             const IGNORE_DELAY_THRESHOLD = 500; // 500ms 内的音频包被认为是延迟包
+            const shouldIgnoreLatePacket =
+                state.playEndSent &&
+                timeSincePlayEnd < IGNORE_DELAY_THRESHOLD &&
+                (!Number.isInteger(state.playEndRoundId) || state.playEndRoundId === state.currentGenerateRoundId);
 
-            if (state.playEndSent && timeSincePlayEnd < IGNORE_DELAY_THRESHOLD) {
+            if (shouldIgnoreLatePacket) {
                 console.warn(
                     `%c⚠️ [${timestamp}] 检测到 play_end 后 ${timeSincePlayEnd.toFixed(0)}ms 的延迟音频包，忽略！`,
                     'color: orange; font-weight: bold; font-size: 14px',
@@ -1967,6 +1989,8 @@ export function useLiveKit() {
                         sid: participant.sid,
                         currentStatus: state.status,
                         generateEnd: state.generateEnd,
+                        playEndRoundId: state.playEndRoundId,
+                        currentGenerateRoundId: state.currentGenerateRoundId,
                         说明: '这可能是网络延迟导致的音频包，属于已结束的轮次，应该被忽略'
                     }
                 );
@@ -2033,6 +2057,7 @@ export function useLiveKit() {
         } else {
             // 音频停止说话，启动优化的检查流程
             const config = getSilenceConfig();
+            const speakingRoundId = resolveRoundId();
             const currentAudioElements = document.querySelectorAll('audio[data-livekit-audio]').length;
             console.log(
                 `%c🔇 [${timestamp}] 远端停止说话 (可能是多段音频的其中一段结束):`,
@@ -2148,9 +2173,45 @@ export function useLiveKit() {
                                         ) {
                                             const recursiveCheck = checkAudioElementsStatus();
                                             if (!recursiveCheck) {
-                                                // 再次触发检查逻辑（通过设置 remoteAudioActive 为 false）
-                                                // 这会增加确认计数
-                                                console.log(`🔄 [${formatSyncedTimestamp()}] 继续确认检查...`);
+                                                const nextCount = (audioEndConfirmCount.get(sid) || currentCount) + 1;
+                                                audioEndConfirmCount.set(sid, nextCount);
+                                                console.log(
+                                                    `🔄 [${formatSyncedTimestamp()}] 继续确认检查... (${nextCount}/${requiredConfirms})`
+                                                );
+
+                                                if (nextCount >= requiredConfirms) {
+                                                    const finalBufferTime = state.mode === 'video' ? 300 : 150;
+                                                    setTimeout(() => {
+                                                        if (
+                                                            !Object.values(state.remoteAudioActive).some(v => v) &&
+                                                            state.generateEnd &&
+                                                            state.status === 'talking'
+                                                        ) {
+                                                            const finalBufferCheck = checkAudioElementsStatus();
+                                                            if (!finalBufferCheck) {
+                                                                audioEndConfirmCount.set(sid, 0);
+                                                                state.status = 'listening';
+                                                                sendPlayEnd(
+                                                                    `静默检查：连续${nextCount}次确认后结束`,
+                                                                    false,
+                                                                    speakingRoundId
+                                                                );
+                                                                console.log(
+                                                                    `🛑 [${formatSyncedTimestamp()}] 连续确认检查通过，切换到 listening`
+                                                                );
+                                                            } else {
+                                                                audioEndConfirmCount.set(sid, 0);
+                                                                console.log(
+                                                                    `🎵 [${formatSyncedTimestamp()}] 最终检查发现有音频，重置计数继续等待...`
+                                                                );
+                                                            }
+                                                        } else {
+                                                            audioEndConfirmCount.set(sid, 0);
+                                                        }
+                                                    }, finalBufferTime);
+                                                }
+                                            } else {
+                                                audioEndConfirmCount.set(sid, 0);
                                             }
                                         } else {
                                             // 状态改变，重置计数
@@ -2175,7 +2236,11 @@ export function useLiveKit() {
                                             if (!finalBufferCheck) {
                                                 audioEndConfirmCount.set(sid, 0); // 重置计数
                                                 state.status = 'listening';
-                                                sendPlayEnd(`静默检查：连续${currentCount}次确认后结束`);
+                                                sendPlayEnd(
+                                                    `静默检查：连续${currentCount}次确认后结束`,
+                                                    false,
+                                                    speakingRoundId
+                                                );
                                                 console.log(
                                                     `🛑 [${formatSyncedTimestamp()}] 连续确认检查通过，切换到 listening`
                                                 );
@@ -2206,7 +2271,11 @@ export function useLiveKit() {
                                         const finalAudioCheck = checkAudioElementsStatus();
                                         if (!finalAudioCheck) {
                                             state.status = 'listening';
-                                            sendPlayEnd(`静默检查：额外${extraCheckTime}ms检查通过`);
+                                            sendPlayEnd(
+                                                `静默检查：额外${extraCheckTime}ms检查通过`,
+                                                false,
+                                                speakingRoundId
+                                            );
                                             console.log(`🛑 [${formatSyncedTimestamp()}] 额外检查后切换到 listening`);
                                         } else {
                                             console.log(
@@ -2223,7 +2292,7 @@ export function useLiveKit() {
                                                     if (!ultimateFinalCheck) {
                                                         // 确实没有音频了，可以安全切换
                                                         state.status = 'listening';
-                                                        sendPlayEnd('静默检查：最终确认后结束');
+                                                        sendPlayEnd('静默检查：最终确认后结束', false, speakingRoundId);
                                                         console.log(
                                                             `🛑 [${formatSyncedTimestamp()}] 最终确认无音频，切换到 listening`
                                                         );
@@ -2247,7 +2316,7 @@ export function useLiveKit() {
                                 isTalking: state.status === 'talking'
                             });
                         }
-                    }, config.safetyDelay);
+                    }, actualSafetyDelay);
                 } else {
                     console.log(`⏸️ [${checkTimestamp}] 基础检查未通过，条件不满足`);
                 }
@@ -2490,8 +2559,18 @@ export function useLiveKit() {
             roomConnected: 0,
             audioCreated: 0,
             videoCreated: 0,
+            tracksCreated: 0,
             tracksPublished: 0,
             completed: 0
+        };
+        const markTracksPublished = source => {
+            const now = performance.now();
+            if (!timings.tracksPublished || now > timings.tracksPublished) {
+                timings.tracksPublished = now;
+            }
+            console.log(
+                `🕒 [计时] tracksPublished 已记录 (${source}), T=${(timings.tracksPublished - timings.start).toFixed(0)}ms`
+            );
         };
         console.log(
             `%c🚀 [LiveKit joinRoom 开始] ${new Date().toLocaleTimeString()}.${Date.now() % 1000}`,
@@ -3257,6 +3336,7 @@ export function useLiveKit() {
                     }
 
                     // 发布未发布的轨道
+                    let publishedCount = 0;
                     for (const track of unpublishedTracks) {
                         try {
                             if (track.kind === 'video') {
@@ -3310,16 +3390,22 @@ export function useLiveKit() {
                                     `%c🎥 [视频轨道] 已发布，开始发送视频数据（${performanceLevel}性能模式）`,
                                     'color: #00ff00; font-weight: bold; font-size: 13px; background: #003300; padding: 2px 6px;'
                                 );
+                                publishedCount += 1;
                             } else if (track.kind === 'audio') {
                                 await state.room.localParticipant.publishTrack(track);
                                 console.log(
                                     '%c🎤 [音频轨道] 已发布，开始发送音频数据',
                                     'color: #00ff00; font-weight: bold; font-size: 13px; background: #003300; padding: 2px 6px;'
                                 );
+                                publishedCount += 1;
                             }
                         } catch (error) {
                             console.error(`❌ 发布${track.kind}轨道失败:`, error);
                         }
+                    }
+
+                    if (publishedCount > 0) {
+                        markTracksPublished(`model_init_success published=${publishedCount}`);
                     }
 
                     console.log(
@@ -3506,11 +3592,15 @@ export function useLiveKit() {
                     {
                         roundId,
                         status: state.status,
-                        generateEnd: state.generateEnd
+                        generateEnd: state.generateEnd,
+                        graceMs: NO_AUDIO_WAIT_EXPLICIT_EMPTY_MS
                     }
                 );
                 if (state.generateEnd && state.status !== 'talking') {
-                    scheduleNoAudioPlayEnd(roundId, '收到 generate_no_audio');
+                    scheduleNoAudioPlayEnd(roundId, '收到 generate_no_audio', {
+                        graceMs: NO_AUDIO_WAIT_EXPLICIT_EMPTY_MS,
+                        policy: 'explicit-generate-no-audio'
+                    });
                 }
             } else if (stateName === 'generate_end') {
                 const roundId = Number.isInteger(stateRoundId) ? stateRoundId : resolveRoundId();
@@ -3573,6 +3663,7 @@ export function useLiveKit() {
                     }
                 );
                 if (!state.currentRoundHasAudio && ['thinking', 'listening'].includes(state.status)) {
+                    const noAudioWaitMs = NO_AUDIO_WAIT_SLOW_SERVER_MS;
                     console.warn(
                         `%c⚠️ [${formatSyncedTimestamp()}] 检测到潜在空轮次（无音频），启动 no-audio 保护窗口`,
                         'color: orange; font-weight: bold; font-size: 14px',
@@ -3581,10 +3672,14 @@ export function useLiveKit() {
                             hasAudio: state.currentRoundHasAudio,
                             generateEnd: state.generateEnd,
                             roundId,
-                            graceMs: NO_AUDIO_GRACE_MS
+                            graceMs: noAudioWaitMs,
+                            说明: '先等待慢服务音频，若随后收到 generate_no_audio 会快速结束'
                         }
                     );
-                    scheduleNoAudioPlayEnd(roundId, 'generate_end 检测到无音频');
+                    scheduleNoAudioPlayEnd(roundId, 'generate_end 检测到无音频（等待慢端音频）', {
+                        graceMs: noAudioWaitMs,
+                        policy: 'await-slow-server-audio'
+                    });
                     return;
                 }
 
@@ -3624,7 +3719,9 @@ export function useLiveKit() {
                             if (finalSpeakingCheck && !finalCheck && state.generateEnd && state.status === 'talking') {
                                 state.status = 'listening';
                                 sendPlayEnd(
-                                    `generate_end：缓冲检测通过（${config.generateEndBuffer}ms, ${state.mode}模式）`
+                                    `generate_end：缓冲检测通过（${config.generateEndBuffer}ms, ${state.mode}模式）`,
+                                    false,
+                                    roundId
                                 );
                                 console.log(
                                     `%c✅ [${formatSyncedTimestamp()}] generate_end 缓冲检测通过，切换到 listening`,
@@ -3661,7 +3758,11 @@ export function useLiveKit() {
                                 state.status === 'talking'
                             ) {
                                 state.status = 'listening';
-                                sendPlayEnd(`generate_end：短音频播放完成（${extraWaitTime.toFixed(0)}ms后检测）`);
+                                sendPlayEnd(
+                                    `generate_end：短音频播放完成（${extraWaitTime.toFixed(0)}ms后检测）`,
+                                    false,
+                                    roundId
+                                );
                                 console.log(
                                     `%c✅ [${formatSyncedTimestamp()}] 短音频播放完成，切换到 listening`,
                                     'color: #00ff00; font-weight: bold; font-size: 14px'
@@ -3687,7 +3788,9 @@ export function useLiveKit() {
                                 // 延迟检查通过，发送 play_end
                                 state.status = 'listening';
                                 sendPlayEnd(
-                                    `generate_end：音频已播完（${config.safetyDelay}ms后检测, ${state.mode}模式）`
+                                    `generate_end：音频已播完（${config.safetyDelay}ms后检测, ${state.mode}模式）`,
+                                    false,
+                                    roundId
                                 );
                                 console.log('🔄 generate_end延迟检查通过，切换到 listening', formatSyncedTimestamp());
                             } else {
@@ -3704,7 +3807,11 @@ export function useLiveKit() {
                                         const finalAudioCheck = checkAudioElementsStatus();
                                         if (!finalAudioCheck) {
                                             state.status = 'listening';
-                                            sendPlayEnd(`generate_end：最终检查通过 (${state.mode}模式)`);
+                                            sendPlayEnd(
+                                                `generate_end：最终检查通过 (${state.mode}模式)`,
+                                                false,
+                                                roundId
+                                            );
                                             console.log('🔄 generate_end最终检查后切换到 listening');
                                         } else {
                                             // 🔧 修复：不要强制切换，而是继续等待静默检查机制处理
@@ -4191,6 +4298,7 @@ export function useLiveKit() {
                         break;
                 }
 
+                let publishedCount = 0;
                 for (const track of tracks) {
                     try {
                         if (track.kind === 'video') {
@@ -4202,16 +4310,22 @@ export function useLiveKit() {
                                 `%c🎥 [视频轨道] 已发布，开始发送视频数据（${performanceLevel}性能模式）`,
                                 'color: #00ff00; font-weight: bold; font-size: 13px; background: #003300; padding: 2px 6px;'
                             );
+                            publishedCount += 1;
                         } else if (track.kind === 'audio') {
                             await state.room.localParticipant.publishTrack(track);
                             console.log(
                                 '%c🎤 [音频轨道] 已发布，开始发送音频数据',
                                 'color: #00ff00; font-weight: bold; font-size: 13px; background: #003300; padding: 2px 6px;'
                             );
+                            publishedCount += 1;
                         }
                     } catch (error) {
                         console.error(`❌ 发布${track.kind}轨道失败:`, error);
                     }
+                }
+
+                if (publishedCount > 0) {
+                    markTracksPublished(`joinRoom_immediate published=${publishedCount}`);
                 }
 
                 console.log(
@@ -4365,8 +4479,11 @@ export function useLiveKit() {
             const roomConnectTime = timings.roomConnected - timings.start;
             const audioCreateTime = timings.audioCreated ? timings.audioCreated - timings.roomConnected : 0;
             const videoCreateTime = timings.videoCreated ? timings.videoCreated - timings.audioCreated : 0;
-            const publishTime = timings.tracksPublished - (timings.videoCreated || timings.audioCreated);
-            const listenerTime = timings.completed - timings.tracksPublished;
+            const publishAnchor = timings.videoCreated || timings.audioCreated || timings.roomConnected;
+            const hasPublishTiming = Boolean(timings.tracksPublished && timings.tracksPublished >= publishAnchor);
+            const publishTime = hasPublishTiming ? timings.tracksPublished - publishAnchor : null;
+            const listenerAnchor = hasPublishTiming ? timings.tracksPublished : timings.tracksCreated || publishAnchor;
+            const listenerTime = timings.completed - listenerAnchor;
 
             console.log(
                 `%c📊 总耗时: ${totalTime.toFixed(0)}ms`,
@@ -4405,9 +4522,12 @@ export function useLiveKit() {
             );
 
             // 4️⃣ 发布轨道
-            const publishColor = publishTime > 3000 ? '#ff8800' : publishTime > 1500 ? '#ffff00' : '#00ff00';
+            const publishColor = !hasPublishTiming ? '#999999' : publishTime > 3000 ? '#ff8800' : publishTime > 1500 ? '#ffff00' : '#00ff00';
+            const publishText = hasPublishTiming
+                ? `${publishTime.toFixed(0)}ms ${publishTime > 3000 ? '⚠️' : publishTime > 1500 ? '⚡' : '✅'}`
+                : '延后（等待 model_init_success）';
             console.log(
-                `%c4️⃣  发布轨道:        ${publishTime.toFixed(0)}ms ${publishTime > 3000 ? '⚠️' : publishTime > 1500 ? '⚡' : '✅'}`,
+                `%c4️⃣  发布轨道:        ${publishText}`,
                 `color: ${publishColor}; font-weight: bold; font-size: 14px;`
             );
 
@@ -4420,7 +4540,7 @@ export function useLiveKit() {
             console.log('%c─────────────────────────────────────────────────────────', 'color: #666666;');
 
             // 🔍 【诊断建议】根据耗时给出优化建议
-            if (roomConnectTime > 5000 || audioCreateTime > 1000 || videoCreateTime > 2000 || publishTime > 3000) {
+            if (roomConnectTime > 5000 || audioCreateTime > 1000 || videoCreateTime > 2000 || (hasPublishTiming && publishTime > 3000)) {
                 console.log(
                     '%c⚠️ 检测到性能问题，以下是优化建议:',
                     'color: #ff8800; font-weight: bold; font-size: 15px; background: #332200; padding: 4px 8px;'
@@ -4470,7 +4590,7 @@ export function useLiveKit() {
                     console.warn('   4. 多个应用占用摄像头');
                 }
 
-                if (publishTime > 3000) {
+                if (hasPublishTiming && publishTime > 3000) {
                     console.warn(
                         `%c🟠 轨道发布较慢 (${publishTime.toFixed(0)}ms)`,
                         'color: #ff8800; font-weight: bold;'
@@ -4479,6 +4599,8 @@ export function useLiveKit() {
                     console.warn('   1. 上传带宽不足');
                     console.warn('   2. 等待视频首帧超时');
                     console.warn('   3. ICE协商时间长');
+                } else if (!hasPublishTiming) {
+                    console.log('%cℹ️ 轨道发布采用延后策略（等待 model_init_success），本次 joinRoom 耗时不计入发布时长', 'color: #999999;');
                 }
 
                 console.log('%c─────────────────────────────────────────────────────────', 'color: #666666;');
@@ -4521,7 +4643,7 @@ export function useLiveKit() {
             const roomRatio = (roomConnectTime / benchmark.roomConnect).toFixed(1);
             const audioRatio = audioCreateTime > 0 ? (audioCreateTime / benchmark.audioCreate).toFixed(1) : 'N/A';
             const videoRatio = videoCreateTime > 0 ? (videoCreateTime / benchmark.videoCreate).toFixed(1) : 'N/A';
-            const publishRatio = (publishTime / benchmark.publish).toFixed(1);
+            const publishRatio = hasPublishTiming ? (publishTime / benchmark.publish).toFixed(1) : 'N/A';
 
             console.log(
                 `📊 总耗时:       ${totalTime.toFixed(0).padStart(6)}ms (正常: ${benchmark.total}ms)    ${totalRatio > 2 ? '🔴' : totalRatio > 1.5 ? '🟠' : '🟢'} ${totalRatio}x`
@@ -4539,9 +4661,13 @@ export function useLiveKit() {
                     `🎥 创建视频:     ${videoCreateTime.toFixed(0).padStart(6)}ms (正常: ${benchmark.videoCreate}ms)     ${videoRatio > 3 ? '🟠' : '🟢'} ${videoRatio}x`
                 );
             }
-            console.log(
-                `📡 发布轨道:     ${publishTime.toFixed(0).padStart(6)}ms (正常: ${benchmark.publish}ms)    ${publishRatio > 2 ? '🟠' : '🟢'} ${publishRatio}x`
-            );
+            if (hasPublishTiming) {
+                console.log(
+                    `📡 发布轨道:     ${publishTime.toFixed(0).padStart(6)}ms (正常: ${benchmark.publish}ms)    ${publishRatio > 2 ? '🟠' : '🟢'} ${publishRatio}x`
+                );
+            } else {
+                console.log('📡 发布轨道:     延后（等待 model_init_success），本次不参与倍率对比');
+            }
 
             console.log('%c─────────────────────────────────────────────────────────', 'color: #666666;');
 
@@ -4576,7 +4702,7 @@ export function useLiveKit() {
                 连接房间: roomConnectTime.toFixed(0) + 'ms',
                 创建音频轨道: audioCreateTime > 0 ? audioCreateTime.toFixed(0) + 'ms' : '跳过',
                 创建视频轨道: videoCreateTime > 0 ? videoCreateTime.toFixed(0) + 'ms' : '跳过',
-                发布轨道: publishTime.toFixed(0) + 'ms',
+                发布轨道: hasPublishTiming ? publishTime.toFixed(0) + 'ms' : '延后（等待 model_init_success）',
                 初始化监听器: listenerTime.toFixed(0) + 'ms',
                 '═══ 性能对比 ═══': '',
                 总耗时倍数: totalRatio + 'x',

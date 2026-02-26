@@ -10,7 +10,7 @@ rtc:
   # 禁用外部 IP 探测，使用指定的 node_ip
   use_external_ip: false
   # 默认回环地址，部署脚本会自动替换为宿主机实际 IP
-  node_ip: "127.0.0.1"
+  node_ip: "192.168.0.203"
 
 # 房间配置
 room:
@@ -25,7 +25,7 @@ keys:
 turn:
   enabled: true
   # 默认回环地址，部署脚本会自动替换为宿主机实际 IP
-  domain: "127.0.0.1"
+  domain: "192.168.0.203"
   # UDP端口
   udp_port: 7882
   # 不使用TLS（本地开发）

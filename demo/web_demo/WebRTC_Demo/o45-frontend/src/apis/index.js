@@ -60,25 +60,33 @@ export const getRtcToken = (type = 'none') => {
     const modelType = localStorage.getItem('modelType') || envMode;
     const payload = { modelType };
 
-    // const durVadTimeValue = localStorage.getItem('durVadTime');
-    // if (durVadTimeValue !== null && durVadTimeValue !== '') {
-    //     const durVadTime = Number(durVadTimeValue);
-    //     if (!Number.isNaN(durVadTime)) {
-    //         payload.durVadTime = durVadTime;
-    //     }
-    // }
+    const durVadTimeValue = localStorage.getItem('durVadTime');
+    if (durVadTimeValue !== null && durVadTimeValue !== '') {
+        const durVadTime = Number(durVadTimeValue);
+        if (Number.isFinite(durVadTime) && durVadTime > 0) {
+            payload.durVadTime = durVadTime;
+        }
+    }
 
-    // const durVadThresholdValue = localStorage.getItem('durVadThreshold');
-    // if (durVadThresholdValue !== null && durVadThresholdValue !== '') {
-    //     const durVadThreshold = Number(durVadThresholdValue);
-    //     if (!Number.isNaN(durVadThreshold)) {
-    //         payload.durVadThreshold = durVadThreshold;
-    //     }
-    // }
+    const durVadThresholdValue = localStorage.getItem('durVadThreshold');
+    if (durVadThresholdValue !== null && durVadThresholdValue !== '') {
+        const durVadThreshold = Number(durVadThresholdValue);
+        if (Number.isFinite(durVadThreshold) && durVadThreshold >= 0) {
+            payload.durVadThreshold = durVadThreshold;
+        }
+    }
 
-    // const vadRaceValue = JSON.parse(localStorage.getItem('vadRace') || 'true');
-    // // payload.vadRace = vadRaceValue;
-    // payload.vadRace = false;
+    const vadRaceValueRaw = localStorage.getItem('vadRace');
+    if (vadRaceValueRaw !== null && vadRaceValueRaw !== '') {
+        try {
+            const vadRaceValue = JSON.parse(vadRaceValueRaw);
+            if (typeof vadRaceValue === 'boolean') {
+                payload.vadRace = vadRaceValue;
+            }
+        } catch (e) {
+            console.warn('解析 vadRace 失败，忽略该配置', e);
+        }
+    }
 
     // const saveDataValue = JSON.parse(localStorage.getItem('saveData') || 'true');
     // payload.saveData = saveDataValue;

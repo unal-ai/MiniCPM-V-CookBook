@@ -1,0 +1,21 @@
+# Use the official minicpmo-backend as the base image
+FROM ghcr.io/openbmb/minicpmo-backend:latest
+
+# Basic required packages for compiling llama.cpp
+USER root
+RUN apt-get update && apt-get install -y cmake build-essential libcurl4-openssl-dev && rm -rf /var/lib/apt/lists/*
+
+# Copy the local llama.cpp-omni source into the container
+# We assume the build context is the engine directory
+COPY ./llama.cpp-omni /llama.cpp-omni
+
+# Build the custom llama-server
+WORKDIR /llama.cpp-omni
+RUN cmake -B build-docker -DCMAKE_BUILD_TYPE=Release
+RUN cmake --build build-docker --target llama-server -j$(nproc)
+
+# Point the LLAMACPP_ROOT to the newly built directory
+ENV LLAMACPP_ROOT="/llama.cpp-omni"
+
+# Reset working directory to where the backend expects
+WORKDIR /app

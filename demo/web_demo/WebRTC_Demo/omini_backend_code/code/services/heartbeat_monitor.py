@@ -11,7 +11,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import json
 
-from services.inference_service_manager import get_service_manager, InferenceServiceManager, ServiceStatus
+from services.inference_service_manager import (
+    get_service_manager,
+    InferenceService,
+    InferenceServiceManager,
+    ServiceStatus,
+)
 from enhanced_logging_config import get_enhanced_logger
 from config.settings import get_heartbeat_settings
 
@@ -98,39 +103,53 @@ class HeartbeatMonitor:
             logger.error(f"释放心跳检查锁失败: {e}")
             return False
     
-    async def check_service_health_direct(self, service_id: str, ip: str, port: int) -> bool:
+    async def check_service_health_direct(self, service: InferenceService) -> bool:
         """
         直接检查服务健康状态(通过HTTP请求)
-        
+
         Args:
-            service_id: 服务ID
-            ip: 服务IP
-            port: 服务端口
-            
+            service: 服务信息
+
         Returns:
             是否健康
         """
         try:
-            # 构建健康检查URL
-            health_url = f"http://{ip}:{port+1}/health"
-            
-            # 设置超时时间
+            # 历史逻辑只探测 port+1（独立健康端口）。在部分环境下该端口不可达，
+            # 这里增加回退：port+1 -> model_port+1 -> model_port -> port。
+            candidate_ports = []
+
+            def append_port(value):
+                if not isinstance(value, int) or value <= 0:
+                    return
+                if value not in candidate_ports:
+                    candidate_ports.append(value)
+
+            append_port(service.port + 1 if service.port else None)
+            append_port(service.model_port + 1 if service.model_port else None)
+            append_port(service.model_port)
+            append_port(service.port)
+
             timeout = aiohttp.ClientTimeout(total=5)
-            
+            probe_errors = []
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(health_url) as response:
-                    if response.status == 200:
-                        # logger.info(f"服务健康检查成功: {service_id}")
-                        return True
-                    else:
-                        logger.info(f"服务健康检查失败: {service_id}, 状态码: {response.status}")
-                        return False
-                        
-        except asyncio.TimeoutError:
-            logger.error(f"服务健康检查超时: {service_id}")
+                for probe_port in candidate_ports:
+                    health_url = f"http://{service.ip}:{probe_port}/health"
+                    try:
+                        async with session.get(health_url) as response:
+                            if response.status == 200:
+                                return True
+                            probe_errors.append(f"{health_url} -> HTTP {response.status}")
+                    except asyncio.TimeoutError:
+                        probe_errors.append(f"{health_url} -> timeout")
+                    except Exception as e:
+                        probe_errors.append(f"{health_url} -> {e}")
+
+            logger.error(
+                f"服务健康检查失败: {service.service_id}, 探测端口={candidate_ports}, 错误={'; '.join(probe_errors[:2])}"
+            )
             return False
         except Exception as e:
-            logger.error(f"服务健康检查异常: {service_id}, 错误: {e}")
+            logger.error(f"服务健康检查异常: {service.service_id}, 错误: {e}")
             return False
     
     async def monitor_services(self):
@@ -145,11 +164,7 @@ class HeartbeatMonitor:
             for service in services:
                 try:
                     # 检查服务健康状态
-                    is_healthy = await self.check_service_health_direct(
-                        service.service_id, 
-                        service.ip, 
-                        service.port
-                    )
+                    is_healthy = await self.check_service_health_direct(service)
                     
                     if not is_healthy:
                         # 服务不健康，标记为离线

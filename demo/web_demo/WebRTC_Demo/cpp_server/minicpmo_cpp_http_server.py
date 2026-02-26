@@ -63,6 +63,15 @@ VISION_BACKEND = os.environ.get("VISION_BACKEND", "metal")
 
 # Token2Wav device: "gpu:1"(默认，GPU加速) 或 "cpu"(节省GPU显存，适合16GB内存机型)
 TOKEN2WAV_DEVICE = os.environ.get("TOKEN2WAV_DEVICE", "gpu:1")
+# 双工生成收尾等待策略：
+# - 未收到任何 WAV 时，给更长等待窗口，避免 T2W 首包晚到被误判 no-audio
+# - 收到首包后，使用较短窗口等待尾包
+DUPLEX_WAIT_FIRST_WAV_SEC = float(os.environ.get("DUPLEX_WAIT_FIRST_WAV_SEC", "8.0"))
+DUPLEX_WAIT_AFTER_WAV_SEC = float(os.environ.get("DUPLEX_WAIT_AFTER_WAV_SEC", "3.0"))
+DUPLEX_NO_NEW_WAV_MAX_ROUNDS = int(os.environ.get("DUPLEX_NO_NEW_WAV_MAX_ROUNDS", "20"))
+# 双工空输出保护：
+# - 若本次 decode 既无文本也无 WAV，则不再按首包长窗硬等，使用更短窗口收尾。
+DUPLEX_EMPTY_WAIT_SEC = float(os.environ.get("DUPLEX_EMPTY_WAIT_SEC", "1.2"))
 
 
 def auto_detect_llm_model(model_dir: str) -> str:
@@ -2361,6 +2370,11 @@ async def _streaming_generate_duplex(generate_request_time):
             
             print(f"[streaming_generate] 开始监控 [双工]:", flush=True)
             print(f"  WAV目录: {tts_wav_dir}", flush=True)
+            print(
+                f"  收尾等待策略: first_wav={DUPLEX_WAIT_FIRST_WAV_SEC:.1f}s, "
+                f"after_wav={DUPLEX_WAIT_AFTER_WAV_SEC:.1f}s, no_new_limit={DUPLEX_NO_NEW_WAV_MAX_ROUNDS}",
+                flush=True,
+            )
             
             wav_queue = asyncio.Queue()
             stop_wav_scanner = asyncio.Event()
@@ -2560,33 +2574,18 @@ async def _streaming_generate_duplex(generate_request_time):
                                     break
                             
                             if is_listen:
-                                # 🔧 [修复音频错位] is_listen=True 时，快速检查是否有残留音频
-                                # 原问题：TTS 异步处理，可能还有未完成的音频
-                                # 解决：非阻塞快速扫描，最多等待 300ms，有新音频就发送
-                                quick_check_start = time.time()
-                                quick_check_rounds = 0
-                                while (time.time() - quick_check_start) < 0.05: # < 50ms
-                                    quick_check_rounds += 1
-                                    # 检查队列中是否有新的 wav
-                                    found_new = False
-                                    while True:
-                                        try:
-                                            wav_chunk = wav_queue.get_nowait()
-                                            yield wav_chunk
-                                            found_new = True
-                                        except asyncio.QueueEmpty:
-                                            break
-                                    if not found_new and quick_check_rounds >= 2:
-                                        break
-                                    await asyncio.sleep(0.02)
-                                
-                                print(f"[streaming_generate] is_listen=True，已发送 {sent_chunk_count} chunks [双工]", flush=True)
+                                # 🔧 [修复短音频] is_listen=True 时，不再立刻退出
+                                # 而是跳出 SSE 循环，让后续的 post-SSE 等待循环收集剩余 WAV
+                                # 原问题：TTS 还在异步处理 LLM 生成的 token，只等了 50ms 就退出
+                                # 导致只发送了 1 个 WAV chunk（~1秒音频）
+                                print(f"[streaming_generate] is_listen=True, 跳出 SSE 循环等待 TTS 完成 [双工]", flush=True)
                                 yield f"data: {json.dumps({'is_listen': True, 'chunks_received': sent_chunk_count}, ensure_ascii=False)}\n\n"
                                 should_exit = True
                                 break
                             
                             if end_of_turn:
-                                print(f"[streaming_generate] end_of_turn=True，已发送 {sent_chunk_count} chunks [双工]", flush=True)
+                                # 同理，end_of_turn 也跳出让 post-SSE 循环收集
+                                print(f"[streaming_generate] end_of_turn=True, 跳出 SSE 循环等待 TTS 完成 [双工]", flush=True)
                                 should_exit = True
                                 break
                     
@@ -2595,11 +2594,40 @@ async def _streaming_generate_duplex(generate_request_time):
                         break
                 
                 print(f"[streaming_generate] SSE 流结束，等待 WAV 扫描完成... [双工]", flush=True)
-                max_final_wait = 3.0
+                # 🔧 关键修复：
+                # 原逻辑在 SSE 结束后仅等待~1s无新 WAV 就退出，T2W 首包晚到时会被误判 generate_no_audio。
+                # 改为：
+                # 1) 若本轮尚未收到任何 WAV，等待更长 first_wav 窗口；
+                # 2) 一旦收到首包，切换到较短 after_wav 窗口收尾。
+                round_start_sent_chunk_count = sent_chunk_count
                 no_new_wav_count = 0
                 final_start = time.time()
-                
-                while (time.time() - final_start) < max_final_wait:
+
+                while True:
+                    elapsed = time.time() - final_start
+                    has_wav_in_this_round = sent_chunk_count > round_start_sent_chunk_count
+                    has_text_in_this_round = len(all_generated_text) > 0
+                    max_final_wait = DUPLEX_WAIT_AFTER_WAV_SEC if has_wav_in_this_round else DUPLEX_WAIT_FIRST_WAV_SEC
+                    if (not has_wav_in_this_round) and (not has_text_in_this_round):
+                        max_final_wait = min(max_final_wait, DUPLEX_EMPTY_WAIT_SEC)
+                    if elapsed >= max_final_wait:
+                        if has_wav_in_this_round:
+                            print(
+                                f"[streaming_generate] 收尾等待超时 {elapsed:.2f}s（已收首包），结束扫描 [双工]",
+                                flush=True
+                            )
+                        elif has_text_in_this_round:
+                            print(
+                                f"[streaming_generate] 首包等待超时 {elapsed:.2f}s（有文本但无 WAV），结束扫描 [双工]",
+                                flush=True
+                            )
+                        else:
+                            print(
+                                f"[streaming_generate] 空输出等待超时 {elapsed:.2f}s（0文本+0WAV），结束扫描 [双工]",
+                                flush=True
+                            )
+                        break
+
                     prev_count = sent_chunk_count
                     
                     while True:
@@ -2613,8 +2641,12 @@ async def _streaming_generate_duplex(generate_request_time):
                         no_new_wav_count = 0
                     else:
                         no_new_wav_count += 1
-                        if no_new_wav_count >= 10:
-                            print(f"[streaming_generate] 连续 {no_new_wav_count} 次无新 WAV，结束扫描 [双工]", flush=True)
+                        # 仅在“本轮已收过首包”后启用快速 no-new 退出；首包前始终按 first_wav 窗口等待。
+                        if has_wav_in_this_round and no_new_wav_count >= DUPLEX_NO_NEW_WAV_MAX_ROUNDS:
+                            print(
+                                f"[streaming_generate] 连续 {no_new_wav_count} 次无新 WAV（已收首包），结束扫描 [双工]",
+                                flush=True
+                            )
                             break
                     
                     await asyncio.sleep(0.1)
@@ -2624,6 +2656,14 @@ async def _streaming_generate_duplex(generate_request_time):
                 await asyncio.wait_for(wav_scanner_task, timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 wav_scanner_task.cancel()
+            
+            # 🔧 [修复遗漏音频] 排空队列中剩余的 wav_chunk
+            while True:
+                try:
+                    wav_chunk = wav_queue.get_nowait()
+                    yield wav_chunk
+                except asyncio.QueueEmpty:
+                    break
             
             if all_generated_text:
                 full_text = "".join(all_generated_text)
